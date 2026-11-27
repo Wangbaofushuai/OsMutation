@@ -788,7 +788,7 @@ function migrate_configuration(){
 
     if [[ -n "$NEW_ROOT_PASS" ]]; then
         (umask 077 && printf 'root:%s\n' "$NEW_ROOT_PASS" > "/${dest_os_dir}/tmp/.osmutation_passwd")
-    elif [ -f /tmp/.osmutation_passwd ] && [ "/${dest_os_dir}/tmp/.osmutation_passwd" != "/tmp/.osmutation_passwd" ]; then
+    elif [ -f /tmp/.osmutation_passwd ] && ! [ "/${dest_os_dir}/tmp/.osmutation_passwd" -ef /tmp/.osmutation_passwd ]; then
         (umask 077 && cp -f /tmp/.osmutation_passwd "/${dest_os_dir}/tmp/.osmutation_passwd")
     fi
 }
@@ -1087,6 +1087,14 @@ function make_temp_os(){
 }
 
 if [ -z "${main:-}" ]; then
+    for _arg in "$@"; do
+        case "$_arg" in
+            -h|--help|--list)
+                make_temp_os "$@"
+                exit $?
+                ;;
+        esac
+    done
     LOG_FILE="/run/osmutation.log"
     [ -w /run ] || LOG_FILE="/tmp/osmutation.log"
     make_temp_os "$@" 2>&1 | tee "$LOG_FILE"

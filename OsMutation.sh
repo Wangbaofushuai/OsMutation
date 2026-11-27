@@ -1137,6 +1137,15 @@ function main(){
     post_install
 }
 
+for _arg in "$@"; do
+    case "$_arg" in
+        -h|--help|--list)
+            main "$@"
+            exit $?
+            ;;
+    esac
+done
+
 LOG_FILE="/run/osmutation.log"
 [ -w /run ] || LOG_FILE="/tmp/osmutation.log"
 main "$@" 2>&1 | tee "$LOG_FILE"
