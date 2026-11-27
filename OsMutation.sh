@@ -1024,6 +1024,8 @@ function migrate_configuration(){
 			EOF
             if [ -n "$gw6" ]; then
                 echo "    gateway ${gw6}" >> /x/etc/network/interfaces
+            else
+                echo "    up ip -6 route add default dev ${dev} 2>/dev/null || true" >> /x/etc/network/interfaces
             fi
         fi
     fi
@@ -1181,10 +1183,60 @@ function configure_sshd(){
 }
 
 function configure_el_networkmanager(){
-    # Configure static IPv4/IPv6 for CentOS/Rocky/AlmaLinux when using non-venet0 interfaces
-    if [[ "$NET_DEV" == venet0* ]] || [[ -z "$NET_IP4" && -z "$NET_IP6" ]]; then
+    # Case 1: OpenVZ venet0 on EL 9/10 (NetworkManager does not natively manage venet0,
+    # and EL 9/10 removed legacy network-scripts). Clean up unused ifcfg-eth0 and install
+    # an idempotent systemd oneshot fallback so venet0 comes up even if host does not inject it.
+    if [[ "$NET_DEV" == venet0* ]]; then
+        rm -f /etc/sysconfig/network-scripts/ifcfg-eth0 2>/dev/null || true
+        systemctl disable NetworkManager-wait-online.service 2>/dev/null || true
+        if [[ -n "$NET_IP4" || -n "$NET_IP6" ]]; then
+            local venet_ip4="${NET_IP4%%/*}"
+            mkdir -p /usr/local/sbin /etc/systemd/system/multi-user.target.wants
+            cat > /usr/local/sbin/osmutation-venet0.sh <<- EOF
+				#!/bin/sh
+				ip link set lo up 2>/dev/null || true
+				ip link set venet0 up 2>/dev/null || true
+			EOF
+            if [ -n "$venet_ip4" ]; then
+                {
+                    echo "ip -4 addr show dev venet0 | grep -q ' ${venet_ip4}/' || ip -4 addr add '${venet_ip4}/32' dev venet0 2>/dev/null || true"
+                    echo "ip -4 route replace default dev venet0 2>/dev/null || true"
+                } >> /usr/local/sbin/osmutation-venet0.sh
+            fi
+            if [ -n "$NET_IP6" ]; then
+                {
+                    echo "ip -6 addr show dev venet0 | grep -q '${NET_IP6%%/*}' || ip -6 addr add '${NET_IP6}' dev venet0 2>/dev/null || true"
+                    echo "ip -6 route replace default dev venet0 2>/dev/null || true"
+                } >> /usr/local/sbin/osmutation-venet0.sh
+            fi
+            chmod 755 /usr/local/sbin/osmutation-venet0.sh
+
+            cat > /etc/systemd/system/osmutation-venet0.service <<- EOF
+				[Unit]
+				Description=OsMutation OpenVZ venet0 Network Fallback
+				After=systemd-udevd.service
+				Before=network-online.target sshd.service
+
+				[Service]
+				Type=oneshot
+				ExecStart=/usr/local/sbin/osmutation-venet0.sh
+				RemainAfterExit=yes
+
+				[Install]
+				WantedBy=multi-user.target
+			EOF
+            systemctl enable osmutation-venet0.service 2>/dev/null || \
+                ln -sf /etc/systemd/system/osmutation-venet0.service /etc/systemd/system/multi-user.target.wants/osmutation-venet0.service
+        fi
         return 0
     fi
+
+    # Case 2: LXC / standard ethernet interface on EL 9/10
+    if [[ -z "$NET_IP4" && -z "$NET_IP6" ]]; then
+        return 0
+    fi
+    # Remove default DHCP ifcfg shipped in LinuxContainers EL 9/10 images so it cannot override our static profile
+    rm -f /etc/sysconfig/network-scripts/ifcfg-eth0 "/etc/sysconfig/network-scripts/ifcfg-${NET_DEV}" 2>/dev/null || true
     mkdir -p /etc/NetworkManager/system-connections
     local nm_file="/etc/NetworkManager/system-connections/osmutation.nmconnection"
     cat > "$nm_file" <<- EOF
@@ -1193,6 +1245,7 @@ function configure_el_networkmanager(){
 		type=ethernet
 		interface-name=${NET_DEV}
 		autoconnect=true
+		autoconnect-priority=100
 
 	EOF
     if [ -n "$NET_IP4" ]; then
@@ -1207,6 +1260,12 @@ function configure_el_networkmanager(){
             echo "dns=8.8.8.8;1.1.1.1;"
             echo ""
         } >> "$nm_file"
+    else
+        {
+            echo "[ipv4]"
+            echo "method=disabled"
+            echo ""
+        } >> "$nm_file"
     fi
     if [ -n "$NET_IP6" ]; then
         {
@@ -1218,6 +1277,12 @@ function configure_el_networkmanager(){
                 echo "address1=${NET_IP6}"
             fi
             echo "dns=2001:4860:4860::8888;"
+            echo ""
+        } >> "$nm_file"
+    else
+        {
+            echo "[ipv6]"
+            echo "method=ignore"
             echo ""
         } >> "$nm_file"
     fi
@@ -1333,7 +1398,7 @@ function post_install(){
     done
 
     if [[ "$reboot_ans" == 'yes' ]]; then
-        reboot -f
+        reboot -f 2>/dev/null || /sbin/reboot -f 2>/dev/null || systemctl --force --force reboot
     fi
 }
 
