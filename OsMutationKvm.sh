@@ -55,36 +55,54 @@ function install(){
     $cmd2 "$@"
 }
 
+REPO="${OSMUTATION_REPO:-Wangbaofushuai/OsMutation}"
+
 function read_lxc_template(){
-    last_lxc_version=$(curl -Ls "https://api.github.com/repos/LloydAsp/OsMutation/releases/latest" | grep "LXC" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-    if [[ -n $last_lxc_version ]]; then
-        image_list=$(curl -Ls "https://api.github.com/repos/LloydAsp/OsMutation/releases/latest" | grep "LXC" | grep '"browser_download_url":' | sed -E 's/.*"([^"]+)".*/\1/')
+    local arch release_json last_lxc_version image_list os_list total_count os_index
+    case "$(uname -m)" in
+        aarch64|arm64) arch="arm64" ;;
+        *)             arch="amd64" ;;
+    esac
 
-        os_list=$(curl -Ls "https://api.github.com/repos/LloydAsp/OsMutation/releases/latest" | grep "LXC" | grep '"browser_download_url":' | sed -E 's/.*"([^"]+)".*/\1/' | sed "s/https\:\/\/github.com\/LloydAsp\/OsMutation\/releases\/download\/${last_lxc_version}\///g" | sed "s/\.tar\.gz//g")
-        echo "$os_list" | nl
+    release_json=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null || true)
+    last_lxc_version=$(printf '%s\n' "$release_json" | grep '"tag_name":' | grep "LXC" | sed -E 's/.*"([^"]+)".*/\1/' | head -n 1)
+    if [[ -n "$last_lxc_version" ]]; then
+        image_list=$(printf '%s\n' "$release_json" | grep '"browser_download_url":' | sed -E 's/.*"([^"]+)".*/\1/' | grep -E '\.tar\.(xz|gz)$' | grep -- "-${arch}\.tar\." | sort -V)
+        os_list=$(printf '%s\n' "$image_list" | sed -E 's|.*/||; s/\.tar\.(xz|gz)$//')
+        total_count=$(printf '%s\n' "$os_list" | wc -l)
+        printf '%s\n' "$os_list" | nl -w 3 -s '  '
 
-        while [ -z "${os_index##*[!0-9]*}" ]; do
-            echo -ne "\e[1;33mplease select os (input number):\e[m"
-            read os_index
+        while true; do
+            echo -ne "\e[1;33mplease select os (1-${total_count}): \e[m"
+            read -r os_index < /dev/tty
+            if [[ "$os_index" =~ ^[0-9]+$ ]] && (( os_index >= 1 && os_index <= total_count )); then
+                break
+            fi
+            echo -e "\e[1;31mInvalid selection.\e[m"
         done
 
-        download_link=$(echo "$image_list" | head -n $os_index | tail -n 1)
+        download_link=$(printf '%s\n' "$image_list" | sed -n "${os_index}p")
     else
-        server=http://images.linuxcontainers.org
+        server=https://images.linuxcontainers.org
         path=$(wget -qO- ${server}/meta/1.0/index-system | \
             grep -v edge | grep default | \
-            awk '-F;' '(( $1=="debian" || $1=="centos" || $1=="alpine") && ( $3=="amd64" || $3=="i386")) {print $NF}')
+            awk -F';' -v arch="$arch" '(( $1=="debian" || $1=="centos" || $1=="alpine" || $1=="ubuntu" || $1=="rockylinux" || $1=="almalinux") && $3==arch) {print $NF}')
 
         os_list=$( echo "$path" | sed -E 's%/images/(.*)/default/.*/%\1%g' | sed 's%/%-%g' )
-        echo "$os_list" | nl
+        total_count=$(printf '%s\n' "$os_list" | wc -l)
+        printf '%s\n' "$os_list" | nl -w 3 -s '  '
 
-        while [ -z "${os_index##*[!0-9]*}" ]; do
-            echo -ne "\e[1;33mplease select os (input number):\e[m"
-            read os_index 
+        while true; do
+            echo -ne "\e[1;33mplease select os (1-${total_count}): \e[m"
+            read -r os_index < /dev/tty
+            if [[ "$os_index" =~ ^[0-9]+$ ]] && (( os_index >= 1 && os_index <= total_count )); then
+                break
+            fi
+            echo -e "\e[1;31mInvalid selection.\e[m"
         done
 
-        path=$( echo "$path" | head -n $os_index | tail -n 1)
-        os_selected=$(echo "$os_list" | head -n $os_index | tail -n 1 )
+        path=$( printf '%s\n' "$path" | sed -n "${os_index}p" )
+        os_selected=$( printf '%s\n' "$os_list" | sed -n "${os_index}p" )
         download_link=${server}/${path}/rootfs.tar.xz
     fi
 }
@@ -287,7 +305,7 @@ function make_temp_os(){
     cp OsMutationKvm.sh /
 
     cd /x
-    curl -qo takeover.sh https://raw.githubusercontent.com/LloydAsp/OsMutation/main/takeover.sh
+    curl -fsSLo takeover.sh "https://raw.githubusercontent.com/${REPO}/main/takeover.sh"
     chmod u+x takeover.sh
     ./takeover.sh
     # Note: disk entry "/" has changed now.

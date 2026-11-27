@@ -1,48 +1,124 @@
-name: Fetch LXC images from linuxcontainers
+name: Sync Container Images from LinuxContainers
+
 on:
   workflow_dispatch:
   schedule:
     - cron: "0 22 * * 1"
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Set variables
-        run: |
-          echo "RELEASE_NAME=LXC images fetched on $(date +%Y%m%d%H%M)" >> $GITHUB_ENV
-          echo "TAG_NAME=LXC-$(date +%Y%m%d%H%M)" >> $GITHUB_ENV
+      - name: Set release variables
         shell: bash
-
-      - name: Fetch LXC images from linuxcontainers
         run: |
-          server=http://images.linuxcontainers.org
-          path=$(wget -qO- ${server}/meta/1.0/index-system | grep -v edge | grep default | awk '-F;' '(( $1=="debian" || $1=="centos" || $1=="alpine") && ( $3=="amd64" || $3=="i386" || $3=="arm64")) {print $NF}')
-          os_index=$(echo "$path" | wc -l)
-          os_list=$(echo "$path" | sed -E 's%/images/(.*)/default/.*/%\1%g' | sed 's%/%-%g')
+          TIMESTAMP=$(date -u +%Y%m%d%H%M)
+          echo "RELEASE_NAME=Container Images Sync (${TIMESTAMP} UTC)" >> "$GITHUB_ENV"
+          echo "TAG_NAME=LXC-${TIMESTAMP}" >> "$GITHUB_ENV"
 
-          mkdir ./publish
+      - name: Fetch latest images from LinuxContainers
+        shell: bash
+        run: |
+          set -euo pipefail
+          SERVER="https://images.linuxcontainers.org"
+          mkdir -p ./publish
           cd ./publish
 
-          i=1
-          while [[ $i -le $os_index ]]; do
-            os_file=$(echo "$os_list" | head -n $i | tail -n 1)
-            os_path=$(echo "$path" | head -n $i | tail -n 1)
-            download_link=${server}/${os_path}/rootfs.tar.xz
-          
-            wget $download_link -O ${os_file}.tar.xz
-          
-            ((i++))
-          done
+          INDEX=$(curl -fsSL "${SERVER}/meta/1.0/index-system")
 
-      - name: Release and upload assets
-        uses: softprops/action-gh-release@v0.1.6
+          # Filter supported distributions and architectures (amd64 & arm64)
+          ENTRIES=$(printf '%s\n' "$INDEX" | awk -F';' '
+            $4 == "default" && ($3 == "amd64" || $3 == "arm64") {
+              distro = $1; rel = $2; arch = $3; path = $NF;
+              if (distro == "alpine" && rel ~ /^3\.[0-9]+$/) {
+                name = "alpine-" rel "-" arch;
+                print name ";" path;
+              } else if (distro == "debian" && (rel == "bullseye" || rel == "bookworm" || rel == "trixie")) {
+                ver = (rel == "bullseye") ? "11" : (rel == "bookworm") ? "12" : "13";
+                name = "debian-" ver "-" rel "-" arch;
+                print name ";" path;
+              } else if (distro == "ubuntu" && (rel == "jammy" || rel == "noble" || rel == "resolute")) {
+                ver = (rel == "jammy") ? "22.04" : (rel == "noble") ? "24.04" : "26.04";
+                name = "ubuntu-" ver "-" rel "-" arch;
+                print name ";" path;
+              } else if (distro == "centos" && (rel == "9-Stream" || rel == "10-Stream")) {
+                name = "centos-" tolower(rel) "-" arch;
+                print name ";" path;
+              } else if (distro == "rockylinux" && (rel == "9" || rel == "10")) {
+                name = "rockylinux-" rel "-" arch;
+                print name ";" path;
+              } else if (distro == "almalinux" && (rel == "9" || rel == "10")) {
+                name = "almalinux-" rel "-" arch;
+                print name ";" path;
+              }
+            }
+          ' | sort -uV)
+
+          if [ -z "$ENTRIES" ]; then
+            echo "Error: No matching images found in LinuxContainers index."
+            exit 1
+          fi
+
+          echo "=== Matched Images ==="
+          echo "$ENTRIES"
+
+          BODY_FILE="../release_notes.md"
+          {
+            echo "## Synced Container RootFS Images"
+            echo ""
+            echo "- Source: \`${SERVER}\`"
+            echo "- Synced at: \`$(date -u '+%Y-%m-%d %H:%M UTC')\`"
+            echo ""
+            echo "### Included Images"
+          } > "$BODY_FILE"
+
+          while IFS=';' read -r os_name os_path; do
+            [ -z "$os_name" ] && continue
+            clean_path="${os_path#/}"
+            clean_path="${clean_path%/}"
+            url="${SERVER}/${clean_path}/rootfs.tar.xz"
+            out="${os_name}.tar.xz"
+            echo "Downloading ${url} -> ${out}"
+            curl -fsSL --retry 3 --retry-delay 5 "$url" -o "$out"
+            xz -t "$out"
+            size=$(du -h "$out" | awk '{print $1}')
+            echo "- \`${out}\` (${size})" >> "$BODY_FILE"
+          done <<< "$ENTRIES"
+
+          sha256sum *.tar.xz > SHA256SUMS.txt
+          ls -lh
+
+      - name: Create GitHub Release and upload assets
+        uses: softprops/action-gh-release@v2
         with:
           name: ${{ env.RELEASE_NAME }}
           tag_name: ${{ env.TAG_NAME }}
+          body_path: ./release_notes.md
           draft: false
           prerelease: false
           files: |
             ./publish/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cleanup old LXC releases (keep latest 3)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          OLD_TAGS=$(gh release list --repo "${{ github.repository }}" --limit 100 --json tagName,createdAt \
+            --jq '[.[] | select(.tagName | startswith("LXC-"))] | sort_by(.createdAt) | reverse | .[3:] | .[].tagName')
+
+          if [ -z "$OLD_TAGS" ]; then
+            echo "No old LXC releases to clean up."
+            exit 0
+          fi
+
+          for tag in $OLD_TAGS; do
+            echo "Deleting old release and tag: $tag"
+            gh release delete "$tag" --repo "${{ github.repository }}" --yes --cleanup-tag || true
+          done
