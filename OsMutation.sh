@@ -117,13 +117,30 @@ function is_old_openvz_kernel(){
 function check_openvz_kernel_compat(){
     local target="$1"
     if [[ "$cttype" == "openvz" ]] && is_old_openvz_kernel; then
-        if echo "$target" | grep -qiE 'debian-13|trixie|ubuntu-24|noble|ubuntu-26|resolute|centos-10|rockylinux-10|almalinux-10'; then
+        local risky=0
+        local ver=""
+        if [[ "$target" =~ ^debian-([0-9]+)- ]]; then
+            ver="${BASH_REMATCH[1]}"
+            (( ver >= 13 )) && risky=1
+        elif echo "$target" | grep -qiE 'debian-(trixie|forky|duke|sid)'; then
+            risky=1
+        elif [[ "$target" =~ ^ubuntu-([0-9]+)\. ]]; then
+            ver="${BASH_REMATCH[1]}"
+            (( ver >= 24 )) && risky=1
+        elif echo "$target" | grep -qiE 'ubuntu-(noble|resolute)'; then
+            risky=1
+        elif [[ "$target" =~ ^(centos|rockylinux|almalinux)-([0-9]+) ]]; then
+            ver="${BASH_REMATCH[2]}"
+            (( ver >= 10 )) && risky=1
+        fi
+
+        if (( risky == 1 )); then
             echo -e "\e[1;31m========================================================================\e[m"
             echo -e "\e[1;31m[WARNING] OpenVZ Old Kernel Compatibility Risk!\e[m"
             echo -e "\e[1;33mDetected OpenVZ kernel: $(uname -r) (cgroup v1 only).\e[m"
             echo -e "\e[1;33mSelected OS '${target}' ships newer systemd that requires cgroup v2.\e[m"
             echo -e "\e[1;33mReinstalling it on OpenVZ 7 will VERY LIKELY fail to boot / lose SSH!\e[m"
-            echo -e "\e[1;32mRecommended for OpenVZ 7: Alpine 3.21~3.24, Debian 12 (bookworm), Ubuntu 22.04, or [0] Legacy v0.0.1.\e[m"
+            echo -e "\e[1;32mRecommended for OpenVZ 7: Alpine 3.x, Debian 12 (bookworm), Ubuntu 22.04, or [0] Legacy v0.0.1.\e[m"
             echo -e "\e[1;31m========================================================================\e[m"
             local confirm
             echo -ne "\e[1;33mContinue anyway? (y/N): \e[m"
@@ -178,39 +195,73 @@ function read_legacy_openvz_template(){
 }
 
 function read_unified_template(){
-    local arch release_json last_lxc_version image_list os_list total_count os_index
+    local arch manifest_json release_json last_lxc_version image_list os_list total_count os_index
     arch=$(detect_arch)
 
-    release_json=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null || true)
-    last_lxc_version=$(printf '%s\n' "$release_json" | grep '"tag_name":' | grep "LXC" | sed -E 's/.*"([^"]+)".*/\1/' | head -n 1)
-
-    if [[ -n "$last_lxc_version" ]]; then
-        image_list=$(printf '%s\n' "$release_json" | grep '"browser_download_url":' | sed -E 's/.*"([^"]+)".*/\1/' | grep -E '\.tar\.(xz|gz)$' | grep -- "-${arch}\.tar\." | sort -V)
-        os_list=$(printf '%s\n' "$image_list" | sed -E 's|.*/||; s/\.tar\.(xz|gz)$//')
-        echo -e "\e[1;32mImage source: GitHub Release (${REPO}@${last_lxc_version})\e[m"
+    # 1. Prefer raw images.json manifest (no GitHub API rate limit, auto-updated weekly)
+    manifest_json=$(curl -fsSL "https://raw.githubusercontent.com/${REPO}/main/images.json" 2>/dev/null || true)
+    if [[ -n "$manifest_json" ]]; then
+        last_lxc_version=$(printf '%s\n' "$manifest_json" | sed -nE 's/.*"tag": *"([^"]+)".*/\1/p' | head -n 1)
+        image_list=$(printf '%s\n' "$manifest_json" | grep "\"arch\": \"${arch}\"" | sed -nE 's/.*"url": *"([^"]+)".*/\1/p')
+        os_list=$(printf '%s\n' "$manifest_json" | grep "\"arch\": \"${arch}\"" | sed -nE 's/.*"name": *"([^"]+)".*/\1/p')
+        if [[ -n "$image_list" ]]; then
+            echo -e "\e[1;32mImage source: Manifest (${REPO}@${last_lxc_version:-latest})\e[m"
+        fi
     fi
 
+    # 2. Fallback to GitHub Releases API
+    if [[ -z "$image_list" ]]; then
+        release_json=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null || true)
+        last_lxc_version=$(printf '%s\n' "$release_json" | grep '"tag_name":' | grep "LXC" | sed -E 's/.*"([^"]+)".*/\1/' | head -n 1)
+
+        if [[ -n "$last_lxc_version" ]]; then
+            image_list=$(printf '%s\n' "$release_json" | grep '"browser_download_url":' | sed -E 's/.*"([^"]+)".*/\1/' | grep -E '\.tar\.(xz|gz)$' | grep -- "-${arch}\.tar\." | sort -V)
+            os_list=$(printf '%s\n' "$image_list" | sed -E 's|.*/||; s/\.tar\.(xz|gz)$//')
+            echo -e "\e[1;32mImage source: GitHub Release (${REPO}@${last_lxc_version})\e[m"
+        fi
+    fi
+
+    # 3. Fallback direct to LinuxContainers (auto-tracks Alpine, Debian stable/oldstable, Ubuntu LTS, EL >= 9)
     if [[ -z "$image_list" ]]; then
         echo -e "\e[1;33mGitHub Release unavailable, falling back to https://images.linuxcontainers.org ...\e[m"
         local server="https://images.linuxcontainers.org"
-        local entries
-        entries=$(curl -fsSL "${server}/meta/1.0/index-system" | awk -F';' -v arch="$arch" '
+        local deb_pairs="" ub_pairs="" entries
+        for suite in oldstable stable; do
+            local rel_txt c v
+            rel_txt=$(curl -fsSL --max-time 10 "https://deb.debian.org/debian/dists/${suite}/Release" 2>/dev/null || true)
+            c=$(printf '%s\n' "$rel_txt" | awk '/^Codename:/{print tolower($2); exit}')
+            v=$(printf '%s\n' "$rel_txt" | awk '/^Version:/{split($2,a,"."); print a[1]; exit}')
+            [[ -n "$c" && -n "$v" ]] && deb_pairs="${deb_pairs} ${c}=${v}"
+        done
+        [ -z "$deb_pairs" ] && deb_pairs="bookworm=12 trixie=13"
+
+        ub_pairs=$(curl -fsSL --max-time 10 "https://changelogs.ubuntu.com/meta-release-lts" 2>/dev/null | awk '
+            /^Dist:/{d=tolower($2)}
+            /^Version:/{split($2,a,"."); v=a[1]"."a[2]}
+            /^Supported:/{if($2=="1" && d!="" && v!="") printf "%s=%s ", d, v; d=""; v=""}
+        ')
+        [ -z "$ub_pairs" ] && ub_pairs="jammy=22.04 noble=24.04 resolute=26.04"
+
+        entries=$(curl -fsSL "${server}/meta/1.0/index-system" | awk -F';' -v arch="$arch" -v deb="$deb_pairs" -v ub="$ub_pairs" '
+            BEGIN {
+                n = split(deb, da, " ");
+                for (i = 1; i <= n; i++) { split(da[i], kv, "="); if (kv[1] != "") dmap[kv[1]] = kv[2]; }
+                m = split(ub, ua, " ");
+                for (i = 1; i <= m; i++) { split(ua[i], kv, "="); if (kv[1] != "") umap[kv[1]] = kv[2]; }
+            }
             $4 == "default" && $3 == arch {
-                distro = $1; rel = $2; path = $NF;
-                if (distro == "alpine" && rel ~ /^3\.[0-9]+$/) {
+                distro = tolower($1); rel = $2; rel_l = tolower(rel); path = $NF;
+                if (distro == "alpine" && rel ~ /^[0-9]+\.[0-9]+$/) {
                     print "alpine-" rel "-" arch ";" path;
-                } else if (distro == "debian" && (rel == "bullseye" || rel == "bookworm" || rel == "trixie")) {
-                    ver = (rel == "bullseye") ? "11" : (rel == "bookworm") ? "12" : "13";
-                    print "debian-" ver "-" rel "-" arch ";" path;
-                } else if (distro == "ubuntu" && (rel == "jammy" || rel == "noble" || rel == "resolute")) {
-                    ver = (rel == "jammy") ? "22.04" : (rel == "noble") ? "24.04" : "26.04";
-                    print "ubuntu-" ver "-" rel "-" arch ";" path;
-                } else if (distro == "centos" && (rel == "9-Stream" || rel == "10-Stream")) {
-                    print "centos-" tolower(rel) "-" arch ";" path;
-                } else if (distro == "rockylinux" && (rel == "9" || rel == "10")) {
-                    print "rockylinux-" rel "-" arch ";" path;
-                } else if (distro == "almalinux" && (rel == "9" || rel == "10")) {
-                    print "almalinux-" rel "-" arch ";" path;
+                } else if (distro == "debian" && (rel_l in dmap)) {
+                    print "debian-" dmap[rel_l] "-" rel_l "-" arch ";" path;
+                } else if (distro == "ubuntu" && (rel_l in umap)) {
+                    print "ubuntu-" umap[rel_l] "-" rel_l "-" arch ";" path;
+                } else if (distro == "centos" && rel_l ~ /^[0-9]+-stream$/) {
+                    split(rel_l, ca, "-");
+                    if (ca[1] + 0 >= 9) print "centos-" rel_l "-" arch ";" path;
+                } else if ((distro == "rockylinux" || distro == "almalinux") && rel ~ /^[0-9]+$/ && (rel + 0 >= 9)) {
+                    print distro "-" rel "-" arch ";" path;
                 }
             }
         ' | sort -uV)

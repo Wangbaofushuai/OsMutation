@@ -4,16 +4,16 @@ Reinstall any OpenVZ / LXC VPS to the latest **Alpine**, **Debian**, **Ubuntu LT
 
 > Forked and updated from [LloydAsp/OsMutation](https://github.com/LloydAsp/OsMutation) with automated weekly container image syncing, unified OpenVZ/LXC modern templates, OpenVZ `venet0` & old-kernel compatibility protection, and bug fixes.
 
-## Supported Systems (Auto-Synced Weekly)
+## Supported Systems (Auto-Discovered & Synced Weekly)
 
-Images are automatically synced weekly from [LinuxContainers](https://images.linuxcontainers.org) via GitHub Actions (`.github/workflows/sync.yml`):
+Images are automatically discovered from upstream official metadata and synced weekly from [LinuxContainers](https://images.linuxcontainers.org) via GitHub Actions (`.github/workflows/sync.yml`), automatically keeping `images.json` up to date (avoiding GitHub's 60-day schedule auto-disable and bypassing GitHub API rate limits):
 
-- **Alpine Linux**: Latest stable releases (e.g. `3.21`, `3.22`, `3.23`, `3.24+`)
-- **Debian**: `12 (Bookworm)`, `13 (Trixie)`
-- **Ubuntu LTS**: `22.04 (Jammy)`, `24.04 (Noble)`, `26.04 (Resolute)`
-- **CentOS Stream**: `9-Stream`, `10-Stream`
-- **Rocky Linux**: `9`, `10`
-- **AlmaLinux**: `9`, `10`
+- **Alpine Linux**: All current stable releases (`3.21+`, automatically tracks `3.25`, `3.26`...)
+- **Debian**: Automatically tracks official `oldstable` & `stable` releases via `deb.debian.org` (currently `12 Bookworm` & `13 Trixie`; automatically picks up `14 Forky` once released as stable)
+- **Ubuntu LTS**: Automatically tracks all supported LTS releases via `changelogs.ubuntu.com/meta-release-lts` (currently `22.04`, `24.04`, `26.04`; automatically picks up `28.04+`)
+- **CentOS Stream**: All major releases `>= 9` (`9-Stream`, `10-Stream`, future `11-Stream`...)
+- **Rocky Linux**: All major releases `>= 9` (`9`, `10`, future `11`...)
+- **AlmaLinux**: All major releases `>= 9` (`9`, `10`, future `11`...)
 - **Legacy OpenVZ 7 Fallback (`Option 0`)**: Retains access to the original `LloydAsp/OsMutation@v0.0.1` OpenVZ 7 template archive for older hosts.
 
 ## Usage / 使用方法

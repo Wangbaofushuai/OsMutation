@@ -12,6 +12,11 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
       - name: Set release variables
         shell: bash
         run: |
@@ -19,77 +24,178 @@ jobs:
           echo "RELEASE_NAME=Container Images Sync (${TIMESTAMP} UTC)" >> "$GITHUB_ENV"
           echo "TAG_NAME=LXC-${TIMESTAMP}" >> "$GITHUB_ENV"
 
-      - name: Fetch latest images from LinuxContainers
+      - name: Auto-discover and fetch latest stable/LTS images
         shell: bash
+        env:
+          REPO_NAME: ${{ github.repository }}
         run: |
           set -euo pipefail
-          SERVER="https://images.linuxcontainers.org"
           mkdir -p ./publish
-          cd ./publish
 
-          INDEX=$(curl -fsSL "${SERVER}/meta/1.0/index-system")
+          python3 - << 'PYEOF'
+          import datetime
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import urllib.request
 
-          # Filter supported distributions and architectures (amd64 & arm64)
-          ENTRIES=$(printf '%s\n' "$INDEX" | awk -F';' '
-            $4 == "default" && ($3 == "amd64" || $3 == "arm64") {
-              distro = $1; rel = $2; arch = $3; path = $NF;
-              if (distro == "alpine" && rel ~ /^3\.[0-9]+$/) {
-                name = "alpine-" rel "-" arch;
-                print name ";" path;
-              } else if (distro == "debian" && (rel == "bullseye" || rel == "bookworm" || rel == "trixie")) {
-                ver = (rel == "bullseye") ? "11" : (rel == "bookworm") ? "12" : "13";
-                name = "debian-" ver "-" rel "-" arch;
-                print name ";" path;
-              } else if (distro == "ubuntu" && (rel == "jammy" || rel == "noble" || rel == "resolute")) {
-                ver = (rel == "jammy") ? "22.04" : (rel == "noble") ? "24.04" : "26.04";
-                name = "ubuntu-" ver "-" rel "-" arch;
-                print name ";" path;
-              } else if (distro == "centos" && (rel == "9-Stream" || rel == "10-Stream")) {
-                name = "centos-" tolower(rel) "-" arch;
-                print name ";" path;
-              } else if (distro == "rockylinux" && (rel == "9" || rel == "10")) {
-                name = "rockylinux-" rel "-" arch;
-                print name ";" path;
-              } else if (distro == "almalinux" && (rel == "9" || rel == "10")) {
-                name = "almalinux-" rel "-" arch;
-                print name ";" path;
-              }
-            }
-          ' | sort -uV)
+          SERVER = "https://images.linuxcontainers.org"
+          REPO = os.environ["REPO_NAME"]
+          TAG = os.environ["TAG_NAME"]
+          ARCHS = {"amd64", "arm64"}
 
-          if [ -z "$ENTRIES" ]; then
-            echo "Error: No matching images found in LinuxContainers index."
-            exit 1
-          fi
+          def fetch_text(url, timeout=20):
+              req = urllib.request.Request(url, headers={"User-Agent": "OsMutation-Sync/2.0"})
+              with urllib.request.urlopen(req, timeout=timeout) as resp:
+                  return resp.read().decode("utf-8", errors="replace")
 
-          echo "=== Matched Images ==="
-          echo "$ENTRIES"
+          def discover_debian_releases():
+              """Auto-discover official Debian oldstable & stable codenames (e.g. 12-bookworm, 13-trixie, future 14-forky)."""
+              mapping = {}
+              for suite in ("oldstable", "stable"):
+                  try:
+                      txt = fetch_text(f"https://deb.debian.org/debian/dists/{suite}/Release")
+                      codename = re.search(r"^Codename:\s*(\S+)", txt, re.M)
+                      version = re.search(r"^Version:\s*([0-9]+)", txt, re.M)
+                      if codename and version:
+                          mapping[codename.group(1).lower()] = version.group(1)
+                  except Exception as e:
+                      print(f"[warn] Failed to query Debian {suite}: {e}", file=sys.stderr)
+              if not mapping:
+                  mapping = {"bookworm": "12", "trixie": "13"}
+              print("Discovered Debian stable/oldstable:", mapping)
+              return mapping
 
-          BODY_FILE="../release_notes.md"
-          {
-            echo "## Synced Container RootFS Images"
-            echo ""
-            echo "- Source: \`${SERVER}\`"
-            echo "- Synced at: \`$(date -u '+%Y-%m-%d %H:%M UTC')\`"
-            echo ""
-            echo "### Included Images"
-          } > "$BODY_FILE"
+          def discover_ubuntu_lts():
+              """Auto-discover supported Ubuntu LTS codenames & versions (e.g. 22.04-jammy, 24.04-noble, 26.04-resolute, future 28.04+)."""
+              mapping = {}
+              try:
+                  txt = fetch_text("https://changelogs.ubuntu.com/meta-release-lts")
+                  for block in re.split(r"\n\s*\n", txt.strip()):
+                      dist = re.search(r"^Dist:\s*(\S+)", block, re.M)
+                      ver = re.search(r"^Version:\s*([0-9]+\.[0-9]+)", block, re.M)
+                      sup = re.search(r"^Supported:\s*([01])", block, re.M)
+                      if dist and ver and sup and sup.group(1) == "1":
+                          mapping[dist.group(1).lower()] = ver.group(1)
+              except Exception as e:
+                  print(f"[warn] Failed to query Ubuntu meta-release-lts: {e}", file=sys.stderr)
+              if not mapping:
+                  mapping = {"jammy": "22.04", "noble": "24.04", "resolute": "26.04"}
+              print("Discovered supported Ubuntu LTS:", mapping)
+              return mapping
 
-          while IFS=';' read -r os_name os_path; do
-            [ -z "$os_name" ] && continue
-            clean_path="${os_path#/}"
-            clean_path="${clean_path%/}"
-            url="${SERVER}/${clean_path}/rootfs.tar.xz"
-            out="${os_name}.tar.xz"
-            echo "Downloading ${url} -> ${out}"
-            curl -fsSL --retry 3 --retry-delay 5 "$url" -o "$out"
-            xz -t "$out"
-            size=$(du -h "$out" | awk '{print $1}')
-            echo "- \`${out}\` (${size})" >> "$BODY_FILE"
-          done <<< "$ENTRIES"
+          debian_map = discover_debian_releases()
+          ubuntu_map = discover_ubuntu_lts()
 
-          sha256sum *.tar.xz > SHA256SUMS.txt
-          ls -lh
+          index_text = fetch_text(f"{SERVER}/meta/1.0/index-system", timeout=30)
+          matched = {}
+
+          for line in index_text.splitlines():
+              parts = line.strip().split(";")
+              if len(parts) < 6:
+                  continue
+              distro, rel, arch, variant = parts[0].lower(), parts[1], parts[2].lower(), parts[3].lower()
+              path = parts[-1].strip("/")
+              if variant != "default" or arch not in ARCHS:
+                  continue
+
+              name = None
+              if distro == "alpine" and re.match(r"^[0-9]+\.[0-9]+$", rel):
+                  name = f"alpine-{rel}-{arch}"
+              elif distro == "debian" and rel.lower() in debian_map:
+                  ver = debian_map[rel.lower()]
+                  name = f"debian-{ver}-{rel.lower()}-{arch}"
+              elif distro == "ubuntu" and rel.lower() in ubuntu_map:
+                  ver = ubuntu_map[rel.lower()]
+                  name = f"ubuntu-{ver}-{rel.lower()}-{arch}"
+              elif distro == "centos":
+                  m = re.match(r"^([0-9]+)-stream$", rel, re.I)
+                  if m and int(m.group(1)) >= 9:
+                      name = f"centos-{m.group(1)}-stream-{arch}"
+              elif distro in ("rockylinux", "almalinux"):
+                  if re.match(r"^[0-9]+$", rel) and int(rel) >= 9:
+                      name = f"{distro}-{rel}-{arch}"
+
+              if name:
+                  matched[name] = (arch, path)
+
+          if not matched:
+              print("Error: No matching images found in LinuxContainers index.", file=sys.stderr)
+              sys.exit(1)
+
+          def natural_key(s):
+              return [int(t) if t.isdigit() else t.lower() for t in re.split(r"([0-9]+)", s)]
+
+          sorted_names = sorted(matched.keys(), key=natural_key)
+          print(f"=== Matched {len(sorted_names)} images ===")
+
+          synced_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+          release_notes = [
+              "## Synced Container RootFS Images",
+              "",
+              f"- Source: `{SERVER}`",
+              f"- Synced at: `{synced_at}`",
+              f"- Auto-discovered Debian releases: `{', '.join(f'{v}-{k}' for k, v in sorted(debian_map.items(), key=lambda x: int(x[1])))}`",
+              "",
+              "### Included Images",
+          ]
+
+          sha_lines = []
+          json_images = []
+
+          for name in sorted_names:
+              arch, rel_path = matched[name]
+              src_url = f"{SERVER}/{rel_path}/rootfs.tar.xz"
+              filename = f"{name}.tar.xz"
+              out_path = os.path.join("publish", filename)
+              print(f"Downloading {src_url} -> {out_path}", flush=True)
+              subprocess.run(
+                  ["curl", "-fsSL", "--retry", "3", "--retry-delay", "5", src_url, "-o", out_path],
+                  check=True,
+              )
+              subprocess.run(["xz", "-t", out_path], check=True)
+
+              h = hashlib.sha256()
+              with open(out_path, "rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              digest = h.hexdigest()
+              size_bytes = os.path.getsize(out_path)
+              size_mb = size_bytes / (1024 * 1024)
+
+              sha_lines.append(f"{digest}  {filename}")
+              release_notes.append(f"- `{filename}` ({size_mb:.1f} MiB)")
+              json_images.append({
+                  "name": name,
+                  "arch": arch,
+                  "url": f"https://github.com/{REPO}/releases/download/{TAG}/{filename}",
+                  "sha256": digest,
+                  "size": size_bytes,
+              })
+
+          with open(os.path.join("publish", "SHA256SUMS.txt"), "w", encoding="utf-8") as f:
+              f.write("\n".join(sha_lines) + "\n")
+
+          with open("release_notes.md", "w", encoding="utf-8") as f:
+              f.write("\n".join(release_notes) + "\n")
+
+          # Write compact one-entry-per-line images.json so shell scripts can parse it without jq/python
+          with open("images.json", "w", encoding="utf-8") as f:
+              f.write("{\n")
+              f.write(f'  "tag": {json.dumps(TAG)},\n')
+              f.write(f'  "synced_at": {json.dumps(synced_at)},\n')
+              f.write(f'  "repo": {json.dumps(REPO)},\n')
+              f.write('  "images": [\n')
+              for idx, item in enumerate(json_images):
+                  comma = "," if idx < len(json_images) - 1 else ""
+                  f.write("    " + json.dumps(item, separators=(", ", ": ")) + comma + "\n")
+              f.write("  ]\n")
+              f.write("}\n")
+          PYEOF
+          ls -lh ./publish
 
       - name: Create GitHub Release and upload assets
         uses: softprops/action-gh-release@v2
@@ -122,3 +228,18 @@ jobs:
             echo "Deleting old release and tag: $tag"
             gh release delete "$tag" --repo "${{ github.repository }}" --yes --cleanup-tag || true
           done
+
+      - name: Commit images.json manifest (keeps scheduled workflow active)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add images.json
+          if git diff --cached --quiet; then
+            echo "images.json unchanged, nothing to commit."
+            exit 0
+          fi
+          git commit -m "chore(sync): update images.json for ${TAG_NAME} [skip ci]"
+          git pull --rebase origin main
+          git push origin main
