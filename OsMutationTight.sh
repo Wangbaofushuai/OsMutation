@@ -5,9 +5,110 @@
 # WARNING: A fresh system will be installed and all old data will be wiped.
 # License: GPLv3; Partly based on https://gist.github.com/trimsj/c1fefd650b5f49ceb8f3efc1b6a1404d
 
+set -o pipefail
+
 REPO="${OSMUTATION_REPO:-Wangbaofushuai/OsMutation}"
 LEGACY_OPENVZ_REPO="${OSMUTATION_LEGACY_REPO:-LloydAsp/OsMutation}"
 LEGACY_OPENVZ_TAG="v0.0.1"
+
+# Global state
+cttype=""
+os_selected=""
+download_link=""
+expected_size=""
+NEW_ROOT_PASS=""
+
+# CLI options
+CLI_OS=""
+CLI_SSH_PORT=""
+CLI_YES=0
+CLI_FORCE=0
+CLI_LIST=0
+CLI_REBOOT=""
+ORIG_ARGS=("$@")
+
+# Populated via /tmp/osmutation_env in post_install
+NET_DEV=""
+NET_IP4=""
+NET_GW4=""
+NET_IP6=""
+NET_GW6=""
+SSH_PORT=""
+
+function print_usage(){
+    cat <<- EOF
+Usage: $0 [OPTIONS]
+
+OsMutationTight - Small Disk (<1GiB) OpenVZ/LXC Reinstall Script
+
+Options:
+  --list                List available OS images for current architecture and exit
+  --os <name>           Select OS non-interactively (exact or partial match, e.g. alpine-3.24)
+  -p, --password <pwd>  Set a new root password for the reinstalled system
+  --ssh-port <port>     Override SSH port for the reinstalled system
+  -y, --yes             Skip final reinstall confirmation prompt
+  --force               Bypass OpenVZ old-kernel cgroup v2 warning prompt
+  --reboot              Automatically reboot after reinstallation succeeds
+  --no-reboot           Do not reboot after reinstallation
+  -h, --help            Show this help message and exit
+EOF
+}
+
+function parse_args(){
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --list)
+                CLI_LIST=1
+                shift
+                ;;
+            --os)
+                [ "$#" -lt 2 ] && { echo "Error: --os requires an argument."; exit 1; }
+                CLI_OS="$2"
+                shift 2
+                ;;
+            -p|--password)
+                [ "$#" -lt 2 ] && { echo "Error: $1 requires an argument."; exit 1; }
+                NEW_ROOT_PASS="$2"
+                shift 2
+                ;;
+            --ssh-port)
+                [ "$#" -lt 2 ] && { echo "Error: --ssh-port requires an argument."; exit 1; }
+                local port_arg="$2"
+                if ! [[ "$port_arg" =~ ^[0-9]+$ ]] || (( port_arg < 1 || port_arg > 65535 )); then
+                    echo "Error: Invalid SSH port '${port_arg}'."
+                    exit 1
+                fi
+                CLI_SSH_PORT="$port_arg"
+                shift 2
+                ;;
+            -y|--yes)
+                CLI_YES=1
+                shift
+                ;;
+            --force)
+                CLI_FORCE=1
+                shift
+                ;;
+            --reboot)
+                CLI_REBOOT="yes"
+                shift
+                ;;
+            --no-reboot)
+                CLI_REBOOT="no"
+                shift
+                ;;
+            -h|--help)
+                print_usage
+                exit 0
+                ;;
+            *)
+                echo "Error: Unknown option '$1'"
+                print_usage
+                exit 1
+                ;;
+        esac
+    done
+}
 
 function print_help(){
     echo -ne "\e[1;32m"
@@ -47,6 +148,40 @@ function detect_alpine_arch(){
         aarch64|arm64) echo "aarch64" ;;
         *)             echo "x86_64" ;;
     esac
+}
+
+function has_ipv4_default_route(){
+    if command -v ip >/dev/null 2>&1; then
+        ip -4 route show default 2>/dev/null | grep -q default
+        return $?
+    fi
+    awk '$2 == "00000000" { found=1 } END { exit !found }' /proc/net/route 2>/dev/null
+}
+
+function has_ipv6_default_route(){
+    if command -v ip >/dev/null 2>&1; then
+        ip -6 route show default 2>/dev/null | grep -q default
+        return $?
+    fi
+    [ -f /proc/net/ipv6_route ] && awk '$1 == "00000000000000000000000000000000" && $2 == "00" { found=1 } END { exit !found }' /proc/net/ipv6_route 2>/dev/null
+}
+
+function ensure_network_dns(){
+    local ok=0
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSLI --max-time 6 "https://raw.githubusercontent.com" >/dev/null 2>&1 && ok=1
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q --spider --timeout=6 "https://raw.githubusercontent.com" >/dev/null 2>&1 && ok=1
+    else
+        (exec 3<>/dev/tcp/raw.githubusercontent.com/443) >/dev/null 2>&1 && ok=1
+    fi
+
+    if (( ok == 0 )); then
+        if ! has_ipv4_default_route && has_ipv6_default_route; then
+            echo -e "\e[1;33mIPv6-only environment detected without NAT64 DNS, adding 2a00:1098:2c::1 ...\e[m"
+            echo "nameserver 2a00:1098:2c::1" > /etc/resolv.conf
+        fi
+    fi
 }
 
 function read_virt_tech(){
@@ -128,6 +263,10 @@ function check_openvz_kernel_compat(){
             echo -e "\e[1;33mReinstalling it on OpenVZ 7 will VERY LIKELY fail to boot / lose SSH!\e[m"
             echo -e "\e[1;32mRecommended for OpenVZ 7: Alpine 3.x, Debian 12 (bookworm), Ubuntu 22.04, or [0] Legacy v0.0.1.\e[m"
             echo -e "\e[1;31m========================================================================\e[m"
+            if (( CLI_FORCE == 1 )); then
+                echo -e "\e[1;33m--force specified, proceeding despite OpenVZ old-kernel risk.\e[m"
+                return 0
+            fi
             local confirm
             echo -ne "\e[1;33mContinue anyway? (y/N): \e[m"
             read -r confirm < /dev/tty
@@ -137,6 +276,81 @@ function check_openvz_kernel_compat(){
         fi
     fi
     return 0
+}
+
+function check_password_compat(){
+    if [[ -n "$NEW_ROOT_PASS" ]]; then
+        return 0
+    fi
+
+    local root_hash=""
+    if [ -f /etc/shadow ]; then
+        root_hash=$(awk -F: '$1=="root"{print $2; exit}' /etc/shadow)
+    fi
+
+    local has_ssh_keys=0
+    [ -s /root/.ssh/authorized_keys ] && has_ssh_keys=1
+
+    local need_new_pass=0
+    local reason=""
+    if [[ "$os_selected" == alpine-* && "$root_hash" == \$y\$* ]]; then
+        need_new_pass=1
+        reason="Current system uses yescrypt (\$y\$) password hash (Debian/Ubuntu default), which Alpine Linux (musl) CANNOT verify!"
+    elif [[ -z "$root_hash" || "$root_hash" == "!"* || "$root_hash" == "*"* ]]; then
+        if (( has_ssh_keys == 0 )); then
+            need_new_pass=1
+            reason="Current root password is locked/empty and no /root/.ssh/authorized_keys was found!"
+        fi
+    fi
+
+    if (( need_new_pass == 1 )); then
+        echo -e "\e[1;31m========================================================================\e[m"
+        echo -e "\e[1;31m[WARNING] Root Password Compatibility Notice!\e[m"
+        echo -e "\e[1;33m${reason}\e[m"
+        if (( has_ssh_keys == 1 )); then
+            echo -e "\e[1;32mDetected /root/.ssh/authorized_keys (SSH key login will still work).\e[m"
+        else
+            echo -e "\e[1;31mWithout setting a compatible root password now, you WILL be locked out of SSH!\e[m"
+        fi
+        echo -e "\e[1;31m========================================================================\e[m"
+
+        if (( CLI_YES == 1 )); then
+            if (( has_ssh_keys == 1 )); then
+                echo -e "\e[1;33mNon-interactive mode (--yes): relying on preserved /root/.ssh/authorized_keys.\e[m"
+                return 0
+            fi
+            echo -e "\e[1;31mError: Non-interactive mode (--yes) requires --password <pwd> for this migration to avoid SSH lockout.\e[m"
+            exit 1
+        fi
+
+        local p1="" p2=""
+        while true; do
+            if (( has_ssh_keys == 1 )); then
+                echo -ne "\e[1;33mEnter new root password (or press Enter to rely on SSH keys only): \e[m"
+            else
+                echo -ne "\e[1;33mEnter new root password: \e[m"
+            fi
+            read -rs p1 < /dev/tty
+            echo ""
+            if [[ -z "$p1" ]]; then
+                if (( has_ssh_keys == 1 )); then
+                    echo -e "\e[1;32mSkipping password reset; SSH key login will be preserved.\e[m"
+                    return 0
+                fi
+                echo -e "\e[1;31mPassword cannot be empty.\e[m"
+                continue
+            fi
+            echo -ne "\e[1;33mConfirm new root password: \e[m"
+            read -rs p2 < /dev/tty
+            echo ""
+            if [[ "$p1" == "$p2" ]]; then
+                NEW_ROOT_PASS="$p1"
+                echo -e "\e[1;32mNew root password recorded and will be applied after installation.\e[m"
+                return 0
+            fi
+            echo -e "\e[1;31mPasswords do not match. Please try again.\e[m"
+        done
+    fi
 }
 
 function read_legacy_openvz_template(){
@@ -149,7 +363,7 @@ function read_legacy_openvz_template(){
     fi
 
     if [[ -z "$image_list" ]]; then
-        os_list=$(wget -qO- "https://github.com/${LEGACY_OPENVZ_REPO}/releases/expanded_assets/${LEGACY_OPENVZ_TAG}" | \
+        os_list=$(curl -fsSL "https://github.com/${LEGACY_OPENVZ_REPO}/releases/expanded_assets/${LEGACY_OPENVZ_TAG}" 2>/dev/null | \
             sed -nE '/\.tar\.gz/s/.*>([^<>]+)\.tar\.gz.*/\1/p' | sort -V)
         if [[ -z "$os_list" ]]; then
             echo -e "\e[1;31mError: Failed to fetch legacy OpenVZ template list.\e[m"
@@ -177,96 +391,168 @@ function read_legacy_openvz_template(){
 
     os_selected=$(printf '%s\n' "$os_list" | sed -n "${os_index}p")
     download_link=$(printf '%s\n' "$image_list" | sed -n "${os_index}p")
+    expected_size=""
     return 0
 }
 
-function read_unified_template(){
-    local arch manifest_json release_json last_lxc_version image_list os_list total_count os_index
-    arch=$(detect_arch)
+function fetch_template_catalog(){
+    local arch="$1"
+    local manifest_json release_json last_lxc_version
+    CATALOG_OS=""
+    CATALOG_URLS=""
+    CATALOG_SIZES=""
 
     # 1. Prefer raw images.json manifest (no GitHub API rate limit, auto-updated weekly)
-    manifest_json=$(curl -fsSL "https://raw.githubusercontent.com/${REPO}/main/images.json" 2>/dev/null || true)
+    manifest_json=$(curl -fsSL --max-time 15 "https://raw.githubusercontent.com/${REPO}/main/images.json" 2>/dev/null || true)
     if [[ -n "$manifest_json" ]]; then
         last_lxc_version=$(printf '%s\n' "$manifest_json" | sed -nE 's/.*"tag": *"([^"]+)".*/\1/p' | head -n 1)
-        image_list=$(printf '%s\n' "$manifest_json" | grep "\"arch\": \"${arch}\"" | sed -nE 's/.*"url": *"([^"]+)".*/\1/p')
-        os_list=$(printf '%s\n' "$manifest_json" | grep "\"arch\": \"${arch}\"" | sed -nE 's/.*"name": *"([^"]+)".*/\1/p')
-        if [[ -n "$image_list" ]]; then
+        local arch_lines
+        arch_lines=$(printf '%s\n' "$manifest_json" | grep "\"arch\": \"${arch}\"")
+        if [[ -n "$arch_lines" ]]; then
+            CATALOG_OS=$(printf '%s\n' "$arch_lines" | sed -nE 's/.*"name": *"([^"]+)".*/\1/p')
+            CATALOG_URLS=$(printf '%s\n' "$arch_lines" | sed -nE 's/.*"url": *"([^"]+)".*/\1/p')
+            CATALOG_SIZES=$(printf '%s\n' "$arch_lines" | sed -nE 's/.*"size": *([0-9]+).*/\1/p')
             echo -e "\e[1;32mImage source: Manifest (${REPO}@${last_lxc_version:-latest})\e[m"
+            return 0
         fi
     fi
 
     # 2. Fallback to GitHub Releases API
-    if [[ -z "$image_list" ]]; then
-        release_json=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null || true)
-        last_lxc_version=$(printf '%s\n' "$release_json" | grep '"tag_name":' | grep "LXC" | sed -E 's/.*"([^"]+)".*/\1/' | head -n 1)
-
-        if [[ -n "$last_lxc_version" ]]; then
-            image_list=$(printf '%s\n' "$release_json" | grep '"browser_download_url":' | sed -E 's/.*"([^"]+)".*/\1/' | grep -E '\.tar\.(xz|gz)$' | grep -- "-${arch}\.tar\." | sort -V)
-            os_list=$(printf '%s\n' "$image_list" | sed -E 's|.*/||; s/\.tar\.(xz|gz)$//')
+    release_json=$(curl -fsSL --max-time 15 "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null || true)
+    last_lxc_version=$(printf '%s\n' "$release_json" | grep '"tag_name":' | grep "LXC" | sed -E 's/.*"([^"]+)".*/\1/' | head -n 1)
+    if [[ -n "$last_lxc_version" ]]; then
+        CATALOG_URLS=$(printf '%s\n' "$release_json" | grep '"browser_download_url":' | sed -E 's/.*"([^"]+)".*/\1/' | grep -E '\.tar\.(xz|gz)$' | grep -- "-${arch}\.tar\." | sort -V)
+        if [[ -n "$CATALOG_URLS" ]]; then
+            CATALOG_OS=$(printf '%s\n' "$CATALOG_URLS" | sed -E 's|.*/||; s/\.tar\.(xz|gz)$//')
             echo -e "\e[1;32mImage source: GitHub Release (${REPO}@${last_lxc_version})\e[m"
+            return 0
         fi
     fi
 
     # 3. Fallback direct to LinuxContainers (auto-tracks Alpine, Debian stable/oldstable, Ubuntu LTS, EL >= 9)
-    if [[ -z "$image_list" ]]; then
-        echo -e "\e[1;33mGitHub Release unavailable, falling back to https://images.linuxcontainers.org ...\e[m"
-        local server="https://images.linuxcontainers.org"
-        local deb_pairs="" ub_pairs="" entries
-        for suite in oldstable stable; do
-            local rel_txt c v
-            rel_txt=$(curl -fsSL --max-time 10 "https://deb.debian.org/debian/dists/${suite}/Release" 2>/dev/null || true)
-            c=$(printf '%s\n' "$rel_txt" | awk '/^Codename:/{print tolower($2); exit}')
-            v=$(printf '%s\n' "$rel_txt" | awk '/^Version:/{split($2,a,"."); print a[1]; exit}')
-            [[ -n "$c" && -n "$v" ]] && deb_pairs="${deb_pairs} ${c}=${v}"
-        done
-        [ -z "$deb_pairs" ] && deb_pairs="bookworm=12 trixie=13"
+    echo -e "\e[1;33mGitHub Release unavailable, falling back to https://images.linuxcontainers.org ...\e[m"
+    local server="https://images.linuxcontainers.org"
+    local deb_pairs="" ub_pairs="" entries suite rel_txt c v
+    for suite in oldstable stable; do
+        rel_txt=$(curl -fsSL --max-time 10 "https://deb.debian.org/debian/dists/${suite}/Release" 2>/dev/null || true)
+        c=$(printf '%s\n' "$rel_txt" | awk '/^Codename:/{print tolower($2); exit}')
+        v=$(printf '%s\n' "$rel_txt" | awk '/^Version:/{split($2,a,"."); print a[1]; exit}')
+        [[ -n "$c" && -n "$v" ]] && deb_pairs="${deb_pairs} ${c}=${v}"
+    done
+    [ -z "$deb_pairs" ] && deb_pairs="bookworm=12 trixie=13"
 
-        ub_pairs=$(curl -fsSL --max-time 10 "https://changelogs.ubuntu.com/meta-release-lts" 2>/dev/null | awk '
-            /^Dist:/{d=tolower($2)}
-            /^Version:/{split($2,a,"."); v=a[1]"."a[2]}
-            /^Supported:/{if($2=="1" && d!="" && v!="") printf "%s=%s ", d, v; d=""; v=""}
-        ')
-        [ -z "$ub_pairs" ] && ub_pairs="jammy=22.04 noble=24.04 resolute=26.04"
+    ub_pairs=$(curl -fsSL --max-time 10 "https://changelogs.ubuntu.com/meta-release-lts" 2>/dev/null | awk '
+        /^Dist:/{d=tolower($2)}
+        /^Version:/{split($2,a,"."); v=a[1]"."a[2]}
+        /^Supported:/{if($2=="1" && d!="" && v!="") printf "%s=%s ", d, v; d=""; v=""}
+    ')
+    [ -z "$ub_pairs" ] && ub_pairs="jammy=22.04 noble=24.04 resolute=26.04"
 
-        entries=$(curl -fsSL "${server}/meta/1.0/index-system" | awk -F';' -v arch="$arch" -v deb="$deb_pairs" -v ub="$ub_pairs" '
-            BEGIN {
-                n = split(deb, da, " ");
-                for (i = 1; i <= n; i++) { split(da[i], kv, "="); if (kv[1] != "") dmap[kv[1]] = kv[2]; }
-                m = split(ub, ua, " ");
-                for (i = 1; i <= m; i++) { split(ua[i], kv, "="); if (kv[1] != "") umap[kv[1]] = kv[2]; }
+    entries=$(curl -fsSL --max-time 20 "${server}/meta/1.0/index-system" | awk -F';' -v arch="$arch" -v deb="$deb_pairs" -v ub="$ub_pairs" '
+        BEGIN {
+            n = split(deb, da, " ");
+            for (i = 1; i <= n; i++) { split(da[i], kv, "="); if (kv[1] != "") dmap[kv[1]] = kv[2]; }
+            m = split(ub, ua, " ");
+            for (i = 1; i <= m; i++) { split(ua[i], kv, "="); if (kv[1] != "") umap[kv[1]] = kv[2]; }
+        }
+        $4 == "default" && $3 == arch {
+            distro = tolower($1); rel = $2; rel_l = tolower(rel); path = $NF;
+            if (distro == "alpine" && rel ~ /^[0-9]+\.[0-9]+$/) {
+                print "alpine-" rel "-" arch ";" path;
+            } else if (distro == "debian" && (rel_l in dmap)) {
+                print "debian-" dmap[rel_l] "-" rel_l "-" arch ";" path;
+            } else if (distro == "ubuntu" && (rel_l in umap)) {
+                print "ubuntu-" umap[rel_l] "-" rel_l "-" arch ";" path;
+            } else if (distro == "centos" && rel_l ~ /^[0-9]+-stream$/) {
+                split(rel_l, ca, "-");
+                if (ca[1] + 0 >= 9) print "centos-" rel_l "-" arch ";" path;
+            } else if ((distro == "rockylinux" || distro == "almalinux") && rel ~ /^[0-9]+$/ && (rel + 0 >= 9)) {
+                print distro "-" rel "-" arch ";" path;
             }
-            $4 == "default" && $3 == arch {
-                distro = tolower($1); rel = $2; rel_l = tolower(rel); path = $NF;
-                if (distro == "alpine" && rel ~ /^[0-9]+\.[0-9]+$/) {
-                    print "alpine-" rel "-" arch ";" path;
-                } else if (distro == "debian" && (rel_l in dmap)) {
-                    print "debian-" dmap[rel_l] "-" rel_l "-" arch ";" path;
-                } else if (distro == "ubuntu" && (rel_l in umap)) {
-                    print "ubuntu-" umap[rel_l] "-" rel_l "-" arch ";" path;
-                } else if (distro == "centos" && rel_l ~ /^[0-9]+-stream$/) {
-                    split(rel_l, ca, "-");
-                    if (ca[1] + 0 >= 9) print "centos-" rel_l "-" arch ";" path;
-                } else if ((distro == "rockylinux" || distro == "almalinux") && rel ~ /^[0-9]+$/ && (rel + 0 >= 9)) {
-                    print distro "-" rel "-" arch ";" path;
-                }
-            }
-        ' | sort -uV)
+        }
+    ' | sort -uV)
 
-        if [[ -z "$entries" ]]; then
-            echo -e "\e[1;31mError: Failed to fetch template list from both GitHub and LinuxContainers.\e[m"
+    if [[ -z "$entries" ]]; then
+        echo -e "\e[1;31mError: Failed to fetch template list from both GitHub and LinuxContainers.\e[m"
+        exit 1
+    fi
+    CATALOG_OS=$(printf '%s\n' "$entries" | cut -d';' -f1)
+    CATALOG_URLS=$(printf '%s\n' "$entries" | cut -d';' -f2 | sed -E "s|^/*|${server}/|; s|/*$|/rootfs.tar.xz|")
+}
+
+function list_templates_and_exit(){
+    local arch
+    arch=$(detect_arch)
+    fetch_template_catalog "$arch"
+    echo ""
+    echo "Available OS templates (arch: ${arch}):"
+    local total i name sz sz_mb
+    total=$(printf '%s\n' "$CATALOG_OS" | wc -l)
+    for (( i=1; i<=total; i++ )); do
+        name=$(printf '%s\n' "$CATALOG_OS" | sed -n "${i}p")
+        sz=$(printf '%s\n' "$CATALOG_SIZES" | sed -n "${i}p")
+        if [[ "$sz" =~ ^[0-9]+$ ]]; then
+            sz_mb=$(( (sz + 1048575) / 1048576 ))
+            printf "  %2d  %-28s (%d MiB)\n" "$i" "$name" "$sz_mb"
+        else
+            printf "  %2d  %s\n" "$i" "$name"
+        fi
+    done
+    exit 0
+}
+
+function read_unified_template(){
+    local arch total_count os_index
+    arch=$(detect_arch)
+    fetch_template_catalog "$arch"
+    total_count=$(printf '%s\n' "$CATALOG_OS" | wc -l)
+
+    if [[ -n "$CLI_OS" ]]; then
+        local matched_idx=""
+        matched_idx=$(printf '%s\n' "$CATALOG_OS" | awk -v target="$CLI_OS" 'tolower($0) == tolower(target) { print NR; exit }')
+        if [[ -z "$matched_idx" ]]; then
+            local matches match_count
+            matches=$(printf '%s\n' "$CATALOG_OS" | awk -v target="$CLI_OS" 'index(tolower($0), tolower(target)) > 0 { print NR }')
+            match_count=$(printf '%s\n' "$matches" | grep -c '^[0-9]' || true)
+            if (( match_count == 1 )); then
+                matched_idx="$matches"
+            elif (( match_count > 1 )); then
+                echo -e "\e[1;31mError: --os '${CLI_OS}' matched multiple templates:\e[m"
+                printf '%s\n' "$CATALOG_OS" | grep -i "$CLI_OS"
+                exit 1
+            else
+                echo -e "\e[1;31mError: --os '${CLI_OS}' not found. Run '$0 --list' to see available OS names.\e[m"
+                exit 1
+            fi
+        fi
+
+        os_selected=$(printf '%s\n' "$CATALOG_OS" | sed -n "${matched_idx}p")
+        download_link=$(printf '%s\n' "$CATALOG_URLS" | sed -n "${matched_idx}p")
+        expected_size=$(printf '%s\n' "$CATALOG_SIZES" | sed -n "${matched_idx}p")
+        if ! check_openvz_kernel_compat "$os_selected"; then
+            echo -e "\e[1;31mAborted due to OpenVZ kernel compatibility check.\e[m"
             exit 1
         fi
-        os_list=$(printf '%s\n' "$entries" | cut -d';' -f1)
-        image_list=$(printf '%s\n' "$entries" | cut -d';' -f2 | sed -E "s|^/*|${server}/|; s|/*$|/rootfs.tar.xz|")
+        echo -e "\e[1;32mSelected OS: ${os_selected}\e[m"
+        echo -e "\e[1;32mDownload URL: ${download_link}\e[m"
+        return 0
     fi
-
-    total_count=$(printf '%s\n' "$os_list" | wc -l)
 
     while true; do
         echo ""
-        printf '%s\n' "$os_list" | nl -w 3 -s '  '
+        local i name sz sz_mb
+        for (( i=1; i<=total_count; i++ )); do
+            name=$(printf '%s\n' "$CATALOG_OS" | sed -n "${i}p")
+            sz=$(printf '%s\n' "$CATALOG_SIZES" | sed -n "${i}p")
+            if [[ "$sz" =~ ^[0-9]+$ ]]; then
+                sz_mb=$(( (sz + 1048575) / 1048576 ))
+                printf "  %2d  %-28s (%d MiB)\n" "$i" "$name" "$sz_mb"
+            else
+                printf "  %2d  %s\n" "$i" "$name"
+            fi
+        done
         if [[ "$cttype" == "openvz" ]]; then
-            echo -e "  0  \e[1;36m[Legacy] OpenVZ 7 archive templates (${LEGACY_OPENVZ_TAG})\e[m"
+            echo -e "   0  \e[1;36m[Legacy] OpenVZ 7 archive templates (${LEGACY_OPENVZ_TAG})\e[m"
         fi
 
         if [[ "$cttype" == "openvz" ]]; then
@@ -285,8 +571,9 @@ function read_unified_template(){
         fi
 
         if [[ "$os_index" =~ ^[0-9]+$ ]] && (( os_index >= 1 && os_index <= total_count )); then
-            os_selected=$(printf '%s\n' "$os_list" | sed -n "${os_index}p")
-            download_link=$(printf '%s\n' "$image_list" | sed -n "${os_index}p")
+            os_selected=$(printf '%s\n' "$CATALOG_OS" | sed -n "${os_index}p")
+            download_link=$(printf '%s\n' "$CATALOG_URLS" | sed -n "${os_index}p")
+            expected_size=$(printf '%s\n' "$CATALOG_SIZES" | sed -n "${os_index}p")
             if check_openvz_kernel_compat "$os_selected"; then
                 break
             fi
@@ -299,25 +586,73 @@ function read_unified_template(){
     echo -e "\e[1;32mDownload URL: ${download_link}\e[m"
 }
 
+function confirm_reinstall(){
+    if (( CLI_YES == 1 )); then
+        return 0
+    fi
+    echo ""
+    echo -e "\e[1;33m==================== Reinstall Summary ====================\e[m"
+    echo -e "  Container : ${cttype} (kernel: $(uname -r))"
+    echo -e "  Target OS : ${os_selected}"
+    if [[ "$expected_size" =~ ^[0-9]+$ ]]; then
+        echo -e "  Archive   : $(( (expected_size + 1048575) / 1048576 )) MiB"
+    fi
+    echo -e "  Source    : ${download_link}"
+    if [[ -n "$NEW_ROOT_PASS" ]]; then
+        echo -e "  Password  : Will be reset to your newly specified password"
+    else
+        echo -e "  Password  : Preserve current root password & /root/.ssh"
+    fi
+    if [[ -n "$CLI_SSH_PORT" ]]; then
+        echo -e "  SSH Port  : ${CLI_SSH_PORT}"
+    fi
+    echo -e "\e[1;31m  WARNING   : ALL DATA ON THIS VPS WILL BE PERMANENTLY WIPED!\e[m"
+    echo -e "\e[1;33m===========================================================\e[m"
+    local ans=""
+    echo -ne "\e[1;33mType 'yes' to confirm and begin reinstallation: \e[m"
+    read -r ans < /dev/tty
+    if [[ "$ans" != "yes" ]]; then
+        echo "Aborted by user."
+        exit 0
+    fi
+}
+
 function download_rootfs(){
-    local tar_flag="-xJ"
+    local tar_args=("-xJ")
     case "$download_link" in
-        *.tar.xz)          tar_flag="-xJ" ;;
-        *.tar.gz|*.tgz)    tar_flag="-xz" ;;
-        *.tar.zst)         tar_flag="--zstd -x" ;;
-        *)                 tar_flag="-xJ" ;;
+        *.tar.xz)       tar_args=("-xJ") ;;
+        *.tar.gz|*.tgz) tar_args=("-xz") ;;
+        *.tar.zst)      tar_args=("--zstd" "-x") ;;
+        *)              tar_args=("-xJ") ;;
     esac
 
-    # Pre-flight check that download URL is reachable before wiping /oldroot
-    if ! curl -fsSLI "$download_link" >/dev/null 2>&1; then
+    # Pre-flight range-GET check (more compatible than HEAD on S3/CDN mirrors) before wiping /oldroot
+    if ! curl -fsSL -r 0-0 --max-time 15 "$download_link" -o /dev/null 2>/dev/null; then
         echo -e "\e[1;31mError: Download URL unreachable: ${download_link}. Aborting before wiping old root!\e[m"
         exit 1
     fi
 
-    cd /oldroot || exit 1
-    rm -rf $(ls -A /oldroot | grep -vE '^(dev|proc|sys|run|x)$')
+    # Clear immutable bit on common system files before wiping /oldroot
+    if command -v chattr >/dev/null 2>&1; then
+        chattr -i /oldroot/etc/resolv.conf /oldroot/etc/hosts /oldroot/etc/hostname 2>/dev/null || true
+    fi
 
-    if ! curl -fsSL "$download_link" | tar -C /oldroot ${tar_flag} --numeric-owner --delay-directory-restore --exclude="dev" --exclude="proc" --exclude="run" --exclude="sys"; then
+    cd /oldroot || exit 1
+    local entry base
+    for entry in /oldroot/* /oldroot/.[!.]* /oldroot/..?*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        base="${entry#/oldroot/}"
+        case "$base" in
+            dev|proc|sys|run|x) continue ;;
+        esac
+        rm -rf "$entry" 2>/dev/null || true
+    done
+
+    # Use anchored excludes so only root-level pseudo-filesystems are skipped
+    if ! curl -fSL --retry 3 --retry-delay 3 "$download_link" | \
+        tar -C /oldroot "${tar_args[@]}" --numeric-owner --delay-directory-restore \
+            --anchored --exclude="./dev" --exclude="./proc" --exclude="./run" --exclude="./sys" \
+            --exclude="dev" --exclude="proc" --exclude="run" --exclude="sys"; then
         echo -e "\e[1;31mError: Failed to extract rootfs into /oldroot!\e[m"
         exit 1
     fi
@@ -333,11 +668,13 @@ function migrate_configuration(){
     fi
     [ -d /root/.ssh ] && mkdir -p "/${dest_os_dir}/root" && cp -a /root/.ssh "/${dest_os_dir}/root/"
 
-    local ssh_port=""
-    if [ -f /etc/ssh/sshd_config ]; then
-        ssh_port=$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/ {print $2; exit}' /etc/ssh/sshd_config)
-    elif [ -f /tmp/osmutation_env ]; then
-        ssh_port=$(awk -F= '/^SSH_PORT=/{gsub(/"/, "", $2); print $2; exit}' /tmp/osmutation_env)
+    local ssh_port="$CLI_SSH_PORT"
+    if [[ -z "$ssh_port" ]]; then
+        if [ -f /etc/ssh/sshd_config ]; then
+            ssh_port=$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/ {print $2; exit}' /etc/ssh/sshd_config)
+        elif [ -f /tmp/osmutation_env ]; then
+            ssh_port=$(awk -F= '/^SSH_PORT=/{gsub(/"/, "", $2); print $2; exit}' /tmp/osmutation_env)
+        fi
     fi
 
     # 2. Save hostname
@@ -348,8 +685,8 @@ function migrate_configuration(){
         echo "127.0.1.1 ${cur_hostname}" >> "/${dest_os_dir}/etc/hosts"
     fi
 
-    # 3. Save network configuration (supports both eth0 and OpenVZ venet0)
-    local dev ipaddr_with_mask gw4 route_part gateway_line ip6_addr gw6
+    # 3. Save network configuration (supports eth0, onlink /32 routes, OpenVZ venet0, IPv6-only)
+    local dev ipaddr_with_mask gw4 route_raw route_part gateway_line ip6_addr gw6
     dev=$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
     [ -z "$dev" ] && dev=$(awk '$2 == "00000000" { print $1; exit }' /proc/net/route 2>/dev/null)
     [ -z "$dev" ] && dev=$(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
@@ -357,7 +694,11 @@ function migrate_configuration(){
 
     ipaddr_with_mask=$(ip -4 addr show dev "$dev" 2>/dev/null | awk '/inet / && /scope global/ {print $2; exit}')
     gw4=$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); exit}}')
-    route_part=$(ip -4 route show default 2>/dev/null | head -n 1 | sed -E 's/^(.*dev [^ ]+).*$/\1/')
+    route_raw=$(ip -4 route show default 2>/dev/null | head -n 1)
+    route_part=$(printf '%s\n' "$route_raw" | sed -E 's/^(.*dev [^ ]+( onlink)?).*$/\1/')
+    if printf '%s\n' "$route_raw" | grep -qw "onlink" && ! printf '%s\n' "$route_part" | grep -qw "onlink"; then
+        route_part="${route_part} onlink"
+    fi
     [ -n "$route_part" ] && gateway_line="up ip route add ${route_part}" || gateway_line=""
 
     ip6_addr=$(ip -6 addr show dev "$dev" 2>/dev/null | awk '/inet6 / && /scope global/ {print $2; exit}')
@@ -368,7 +709,6 @@ function migrate_configuration(){
         cp -rf /etc/network/interfaces "/${dest_os_dir}/etc/network/interfaces"
         [ -d /etc/network/interfaces.d ] && cp -a /etc/network/interfaces.d "/${dest_os_dir}/etc/network/"
     elif [[ "$dev" == venet0* ]]; then
-        local venet_ip="${ipaddr_with_mask%%/*}"
         cat > "/${dest_os_dir}/etc/network/interfaces" <<- EOF
 			auto lo
 			iface lo inet loopback
@@ -377,11 +717,16 @@ function migrate_configuration(){
 			iface venet0 inet manual
 			    up ifconfig venet0 up 2>/dev/null || ip link set venet0 up
 			    up ip route add default dev venet0 2>/dev/null || true
+		EOF
+        if [ -n "$ipaddr_with_mask" ]; then
+            local venet_ip="${ipaddr_with_mask%%/*}"
+            cat >> "/${dest_os_dir}/etc/network/interfaces" <<- EOF
 
 			auto venet0:0
 			iface venet0:0 inet static
 			    address ${venet_ip}/32
-		EOF
+			EOF
+        fi
         if [ -n "$ip6_addr" ]; then
             cat >> "/${dest_os_dir}/etc/network/interfaces" <<- EOF
 
@@ -403,7 +748,7 @@ function migrate_configuration(){
 			    address ${ipaddr_with_mask}
 			    ${gateway_line}
 			EOF
-        else
+        elif [ -z "$ip6_addr" ]; then
             cat >> "/${dest_os_dir}/etc/network/interfaces" <<- EOF
 			iface ${dev} inet dhcp
 			EOF
@@ -440,13 +785,12 @@ function migrate_configuration(){
 		NET_GW6="${gw6}"
 		SSH_PORT="${ssh_port}"
 	EOF
-}
 
-function chroot_run(){
-    if [ -f /x/etc/alpine-release ] || grep -qi alpine /x/etc/issue 2>/dev/null; then
-        chroot "/x/" /bin/sh -c "[ -x /bin/bash ] || apk add --no-cache bash"
+    if [[ -n "$NEW_ROOT_PASS" ]]; then
+        (umask 077 && printf 'root:%s\n' "$NEW_ROOT_PASS" > "/${dest_os_dir}/tmp/.osmutation_passwd")
+    elif [ -f /tmp/.osmutation_passwd ] && [ "/${dest_os_dir}/tmp/.osmutation_passwd" != "/tmp/.osmutation_passwd" ]; then
+        (umask 077 && cp -f /tmp/.osmutation_passwd "/${dest_os_dir}/tmp/.osmutation_passwd")
     fi
-    chroot "/x/" /bin/bash -c "$*"
 }
 
 function configure_sshd(){
@@ -523,6 +867,7 @@ function configure_el_networkmanager(){
 
 function post_install(){
     export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    # shellcheck disable=SC1091
     [ -f /tmp/osmutation_env ] && source /tmp/osmutation_env
 
     local os_id=""
@@ -541,10 +886,15 @@ function post_install(){
         fi
     elif [[ "$os_id" == "debian" || "$os_id" == "ubuntu" ]] || [ -f /etc/debian_version ]; then
         install openssh-server ifupdown
+        if [ -f /etc/network/interfaces ]; then
+            sed -i -E '/^[[:space:]]*hostname[[:space:]]+/d' /etc/network/interfaces
+        fi
         systemctl enable ssh 2>/dev/null || systemctl enable sshd 2>/dev/null || true
+        systemctl enable networking.service 2>/dev/null || true
         systemctl disable systemd-networkd.service 2>/dev/null || true
         systemctl disable systemd-networkd.socket 2>/dev/null || true
         systemctl disable systemd-networkd-wait-online.service 2>/dev/null || true
+        systemctl disable systemd-network-generator.service 2>/dev/null || true
         rm -f /etc/netplan/*.yaml 2>/dev/null || true
     elif [[ "$os_id" == "centos" || "$os_id" == "rocky" || "$os_id" == "almalinux" || "$os_id" == "rhel" ]] || [ -f /etc/redhat-release ]; then
         install openssh-server NetworkManager
@@ -556,12 +906,46 @@ function post_install(){
         install openssh-server || install openssh || true
     fi
 
+    if [ -f /tmp/.osmutation_passwd ]; then
+        if chpasswd -c SHA512 < /tmp/.osmutation_passwd 2>/dev/null || chpasswd < /tmp/.osmutation_passwd; then
+            echo -e "\e[1;32mNew root password applied successfully.\e[m"
+        else
+            echo -e "\e[1;31mWARNING: Failed to apply new root password via chpasswd! Please run 'passwd root' manually before rebooting!\e[m"
+        fi
+        rm -f /tmp/.osmutation_passwd
+    fi
+
     configure_sshd
     rm -rf /x /tmp/osmutation_env
     sync
 
-    echo -e "\e[1;32mReinstallation complete! Root password and SSH keys have been preserved.\e[m"
-    local reboot_ans=""
+    local ssh_ok=1
+    if ! command -v sshd >/dev/null 2>&1 && [ ! -x /usr/sbin/sshd ]; then
+        ssh_ok=0
+        echo -e "\e[1;31m========================================================================\e[m"
+        echo -e "\e[1;31m[CRITICAL] sshd binary NOT FOUND! Package installation may have failed!\e[m"
+        echo -e "\e[1;31mDO NOT REBOOT YET! Install openssh-server manually in this shell first.\e[m"
+        echo -e "\e[1;31m========================================================================\e[m"
+    else
+        mkdir -p /run/sshd 2>/dev/null || true
+        if ! sshd -t 2>/dev/null; then
+            ssh_ok=0
+            echo -e "\e[1;31m[CRITICAL] 'sshd -t' config test FAILED! Check /etc/ssh/sshd_config before rebooting!\e[m"
+        fi
+    fi
+
+    if (( ssh_ok == 1 )); then
+        echo -e "\e[1;32mReinstallation complete & sshd verified OK!\e[m"
+        if [[ -n "$SSH_PORT" && "$SSH_PORT" != "22" ]]; then
+            echo -e "\e[1;32mActive SSH port: ${SSH_PORT}\e[m"
+        fi
+    fi
+
+    local reboot_ans="$CLI_REBOOT"
+    if (( ssh_ok == 0 )); then
+        reboot_ans=""
+    fi
+
     while [[ "$reboot_ans" != 'yes' && "$reboot_ans" != 'no' ]]; do
         echo -ne "\e[1;33mreboot now? (yes/no): \e[m"
         read -r reboot_ans < /dev/tty
@@ -573,6 +957,7 @@ function post_install(){
 }
 
 function install_requirement(){
+    ensure_network_dns
     if [ -n "$(command -v apk)" ]; then
         install curl sed gawk wget gzip xz tar virt-what iproute2 ca-certificates
     elif [ -n "$(command -v apt-get)" ]; then
@@ -580,20 +965,26 @@ function install_requirement(){
     else
         install curl sed gawk wget gzip xz tar virt-what iproute ca-certificates
     fi
+    ensure_network_dns
 }
 
 function main(){
+    parse_args "$@"
     print_help
     echo -e '\e[1;32minstall requirement...\e[m'
     install_requirement
     read_virt_tech
     read_unified_template
+    check_password_compat
+    confirm_reinstall
 
     echo -e '\e[1;32mdownloading template...\e[m'
     download_rootfs
 
     echo -e '\e[1;32mmigrating configuration...\e[m'
     migrate_configuration oldroot
+
+    touch /tmp/.osmutation_replaced
 }
 
 function fetch_url(){
@@ -608,12 +999,28 @@ function fetch_url(){
     fi
 }
 
-function make_temp_os(){
-    check_root
-    # IPv6-only NAT64 fallback only when IPv4 default route is absent
-    if ! ip -4 route show default 2>/dev/null | grep -q default && ip -6 route show default 2>/dev/null | grep -q default; then
-        fetch_url "https://api.github.com" >/dev/null 2>&1 || echo "nameserver 2a00:1098:2c::1" > /etc/resolv.conf
+CHROOT_MOUNTS_ACTIVE=0
+function cleanup_chroot_mounts(){
+    if (( CHROOT_MOUNTS_ACTIVE == 0 )); then
+        return 0
     fi
+    local m
+    for m in /x/oldroot /x/sys /x/proc /x/dev/pts /x/dev; do
+        if mountpoint -q "$m" 2>/dev/null; then
+            umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null || true
+        fi
+    done
+    CHROOT_MOUNTS_ACTIVE=0
+}
+
+function make_temp_os(){
+    parse_args "$@"
+    if (( CLI_LIST == 1 )); then
+        list_templates_and_exit
+    fi
+
+    check_root
+    ensure_network_dns
 
     local alpine_arch minirootfs_file temp_os_url
     alpine_arch=$(detect_alpine_arch)
@@ -642,18 +1049,48 @@ function make_temp_os(){
     cp "$script_self" /x/OsMutationTight.sh
     chmod +x /x/OsMutationTight.sh
 
-    mkdir -p /x/oldroot
+    # Mount essential pseudo-filesystems so /dev/tty, /dev/null, /dev/urandom, /proc work inside chroot
+    mkdir -p /x/oldroot /x/dev /x/dev/pts /x/proc /x/sys
+    trap cleanup_chroot_mounts EXIT INT TERM
+    CHROOT_MOUNTS_ACTIVE=1
+    mount --bind /dev /x/dev
+    [ -d /dev/pts ] && mount --bind /dev/pts /x/dev/pts 2>/dev/null || true
+    mount --bind /proc /x/proc
+    mount --bind /sys /x/sys
     mount --bind / /x/oldroot
-    chroot_run env main=1 /OsMutationTight.sh
-    umount /x/oldroot
+
+    # Install bash inside temporary Alpine chroot, then invoke main=1 with forwarded CLI arguments
+    if ! chroot /x /bin/sh -c "[ -x /bin/bash ] || apk add --no-cache bash"; then
+        echo -e "\e[1;31mError: Failed to install bash in temporary Alpine chroot.\e[m"
+        cleanup_chroot_mounts
+        rm -rf /x
+        exit 1
+    fi
+
+    local chroot_rc=0
+    chroot /x /usr/bin/env main=1 /bin/bash /OsMutationTight.sh "${ORIG_ARGS[@]}" || chroot_rc=$?
+
+    local replaced=0
+    [ -f /x/tmp/.osmutation_replaced ] && replaced=1
+    cleanup_chroot_mounts
+    trap - EXIT INT TERM
+
+    if (( chroot_rc != 0 || replaced == 0 )); then
+        if (( replaced == 0 )); then
+            rm -rf /x
+        fi
+        exit "$chroot_rc"
+    fi
 
     echo -e '\e[1;32mpost processing...\e[m'
     post_install
 }
 
-if [ -z "$main" ]; then
-    make_temp_os 2>&1 | tee reinstall.log
-    exit 0
+if [ -z "${main:-}" ]; then
+    LOG_FILE="/run/osmutation.log"
+    [ -w /run ] || LOG_FILE="/tmp/osmutation.log"
+    make_temp_os "$@" 2>&1 | tee "$LOG_FILE"
+    exit $?
 fi
 
-main
+main "$@"

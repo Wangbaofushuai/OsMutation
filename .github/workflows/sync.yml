@@ -2,11 +2,21 @@ name: Sync Container Images from LinuxContainers
 
 on:
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Force publish a new release even if upstream image builds are unchanged"
+        required: false
+        default: false
+        type: boolean
   schedule:
     - cron: "0 22 * * 1"
 
 permissions:
   contents: write
+
+concurrency:
+  group: sync-images
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -25,9 +35,11 @@ jobs:
           echo "TAG_NAME=LXC-${TIMESTAMP}" >> "$GITHUB_ENV"
 
       - name: Auto-discover and fetch latest stable/LTS images
+        id: sync
         shell: bash
         env:
           REPO_NAME: ${{ github.repository }}
+          FORCE_SYNC: ${{ github.event.inputs.force || 'false' }}
         run: |
           set -euo pipefail
           mkdir -p ./publish
@@ -45,10 +57,11 @@ jobs:
           SERVER = "https://images.linuxcontainers.org"
           REPO = os.environ["REPO_NAME"]
           TAG = os.environ["TAG_NAME"]
+          FORCE_SYNC = os.environ.get("FORCE_SYNC", "false").lower() == "true"
           ARCHS = {"amd64", "arm64"}
 
           def fetch_text(url, timeout=20):
-              req = urllib.request.Request(url, headers={"User-Agent": "OsMutation-Sync/2.0"})
+              req = urllib.request.Request(url, headers={"User-Agent": "OsMutation-Sync/2.1"})
               with urllib.request.urlopen(req, timeout=timeout) as resp:
                   return resp.read().decode("utf-8", errors="replace")
 
@@ -130,7 +143,35 @@ jobs:
               return [int(t) if t.isdigit() else t.lower() for t in re.split(r"([0-9]+)", s)]
 
           sorted_names = sorted(matched.keys(), key=natural_key)
-          print(f"=== Matched {len(sorted_names)} images ===")
+
+          # Check if upstream image build paths changed compared to existing images.json
+          # Also force a keep-alive refresh if last sync is >= 45 days old (prevents GitHub 60-day schedule auto-disable)
+          prev_paths = {}
+          days_since_sync = 999
+          if os.path.exists("images.json"):
+              try:
+                  with open("images.json", "r", encoding="utf-8") as f:
+                      prev_data = json.load(f)
+                  for item in prev_data.get("images", []):
+                      if "name" in item and "src_path" in item:
+                          prev_paths[item["name"]] = item["src_path"]
+                  prev_ts = prev_data.get("synced_at", "")
+                  if prev_ts:
+                      dt = datetime.datetime.strptime(prev_ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+                      days_since_sync = (datetime.datetime.now(datetime.timezone.utc) - dt).days
+              except Exception as e:
+                  print(f"[warn] Could not read previous images.json: {e}", file=sys.stderr)
+
+          curr_paths = {n: matched[n][1] for n in sorted_names}
+          gh_out = os.environ.get("GITHUB_OUTPUT")
+          if not FORCE_SYNC and prev_paths and curr_paths == prev_paths and days_since_sync < 45:
+              print(f"All {len(sorted_names)} upstream image builds are unchanged (last sync {days_since_sync}d ago). Skipping duplicate release.")
+              if gh_out:
+                  with open(gh_out, "a", encoding="utf-8") as f:
+                      f.write("changed=false\n")
+              sys.exit(0)
+
+          print(f"=== Syncing {len(sorted_names)} images (force={FORCE_SYNC}, days_since_sync={days_since_sync}) ===")
 
           synced_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
           release_notes = [
@@ -145,6 +186,7 @@ jobs:
 
           sha_lines = []
           json_images = []
+          failed_images = []
 
           for name in sorted_names:
               arch, rel_path = matched[name]
@@ -152,11 +194,18 @@ jobs:
               filename = f"{name}.tar.xz"
               out_path = os.path.join("publish", filename)
               print(f"Downloading {src_url} -> {out_path}", flush=True)
-              subprocess.run(
-                  ["curl", "-fsSL", "--retry", "3", "--retry-delay", "5", src_url, "-o", out_path],
-                  check=True,
-              )
-              subprocess.run(["xz", "-t", out_path], check=True)
+              try:
+                  subprocess.run(
+                      ["curl", "-fsSL", "--retry", "3", "--retry-delay", "5", "--max-time", "300", src_url, "-o", out_path],
+                      check=True,
+                  )
+                  subprocess.run(["xz", "-t", out_path], check=True)
+              except subprocess.CalledProcessError as e:
+                  print(f"[warn] Failed to download/verify {name}: {e}", file=sys.stderr)
+                  if os.path.exists(out_path):
+                      os.remove(out_path)
+                  failed_images.append(name)
+                  continue
 
               h = hashlib.sha256()
               with open(out_path, "rb") as f:
@@ -174,7 +223,19 @@ jobs:
                   "url": f"https://github.com/{REPO}/releases/download/{TAG}/{filename}",
                   "sha256": digest,
                   "size": size_bytes,
+                  "src_path": rel_path,
               })
+
+          # Abort if too many images failed (>20% or 0 succeeded)
+          if not json_images or len(failed_images) > max(2, len(sorted_names) // 5):
+              print(f"Error: Too many image downloads failed ({len(failed_images)}/{len(sorted_names)}): {failed_images}", file=sys.stderr)
+              sys.exit(1)
+
+          if failed_images:
+              release_notes.append("")
+              release_notes.append("### Skipped (Temporary Upstream Errors)")
+              for fn in failed_images:
+                  release_notes.append(f"- `{fn}`")
 
           with open(os.path.join("publish", "SHA256SUMS.txt"), "w", encoding="utf-8") as f:
               f.write("\n".join(sha_lines) + "\n")
@@ -194,10 +255,15 @@ jobs:
                   f.write("    " + json.dumps(item, separators=(", ", ": ")) + comma + "\n")
               f.write("  ]\n")
               f.write("}\n")
+
+          if gh_out:
+              with open(gh_out, "a", encoding="utf-8") as f:
+                  f.write("changed=true\n")
           PYEOF
-          ls -lh ./publish
+          ls -lh ./publish || true
 
       - name: Create GitHub Release and upload assets
+        if: steps.sync.outputs.changed == 'true'
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ env.RELEASE_NAME }}
@@ -205,12 +271,14 @@ jobs:
           body_path: ./release_notes.md
           draft: false
           prerelease: false
+          fail_on_unmatched_files: true
           files: |
             ./publish/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Cleanup old LXC releases (keep latest 3)
+        if: steps.sync.outputs.changed == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -230,6 +298,7 @@ jobs:
           done
 
       - name: Commit images.json manifest (keeps scheduled workflow active)
+        if: steps.sync.outputs.changed == 'true'
         shell: bash
         run: |
           set -euo pipefail

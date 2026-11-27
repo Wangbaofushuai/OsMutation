@@ -1,0 +1,67 @@
+name: Lint & Script Checks
+
+on:
+  push:
+    paths:
+      - "*.sh"
+      - ".github/workflows/*.yml"
+      - "images.json"
+  pull_request:
+    paths:
+      - "*.sh"
+      - ".github/workflows/*.yml"
+      - "images.json"
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Shell syntax check (bash -n / sh -n)
+        run: |
+          set -euo pipefail
+          bash -n OsMutation.sh
+          bash -n OsMutationTight.sh
+          bash -n OsMutationKvm.sh
+          sh -n takeover.sh
+
+      - name: ShellCheck static analysis
+        run: |
+          set -euo pipefail
+          shellcheck -S warning OsMutation.sh OsMutationTight.sh OsMutationKvm.sh takeover.sh
+
+      - name: Validate sync.yml inline Python & images.json
+        run: |
+          set -euo pipefail
+          python3 - << 'EOF'
+          import json
+          import pathlib
+          import re
+
+          # 1. Validate inline Python inside sync.yml
+          wf = pathlib.Path(".github/workflows/sync.yml").read_text(encoding="utf-8")
+          m = re.search(r"python3 - << 'PYEOF'\n(.*?)\n          PYEOF", wf, re.S)
+          assert m, "Inline Python block not found in sync.yml"
+          code = "\n".join(line[10:] if line.startswith("          ") else line for line in m.group(1).splitlines())
+          compile(code, "sync.yml:inline_python", "exec")
+          print("sync.yml inline Python compiled OK.")
+
+          # 2. Validate images.json structure
+          data = json.loads(pathlib.Path("images.json").read_text(encoding="utf-8"))
+          assert "tag" in data and "images" in data and len(data["images"]) > 0
+          for item in data["images"]:
+              for k in ("name", "arch", "url", "sha256", "size"):
+                  assert k in item, f"Missing key {k} in {item}"
+          print(f"images.json validated OK ({len(data['images'])} images, tag={data['tag']}).")
+          EOF
+
+      - name: Smoke test CLI --help and --list
+        run: |
+          set -euo pipefail
+          ./OsMutation.sh --help >/dev/null
+          ./OsMutationTight.sh --help >/dev/null
+          ./OsMutation.sh --list
+          ./OsMutationTight.sh --list

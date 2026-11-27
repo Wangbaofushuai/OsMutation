@@ -10,7 +10,6 @@ if [ ! -e fakeinit ]; then
     exit 1
 fi
 
-
 ./busybox echo "Setting up target filesystem..."
 ./busybox rm -f etc/mtab
 ./busybox ln -s /proc/mounts etc/mtab
@@ -35,7 +34,8 @@ TTY="$(./busybox tty)"
 exec <"$TO/$TTY" >"$TO/$TTY" 2>"$TO/$TTY"
 
 ./busybox echo "Preparing init..."
-./busybox cat >tmp/${OLD_INIT##*/} <<EOF
+INIT_NAME="${OLD_INIT##*/}"
+./busybox cat >"tmp/${INIT_NAME}" <<EOF
 #!${TO}/busybox sh
 
 exec <"${TO}/${TTY}" >"${TO}/${TTY}" 2>"${TO}/${TTY}"
@@ -48,14 +48,13 @@ cd "${TO}"
 ./busybox echo "Chrooting and running init..."
 exec ./busybox chroot . /fakeinit
 EOF
-./busybox chmod +x tmp/${OLD_INIT##*/}
-
+./busybox chmod +x "tmp/${INIT_NAME}"
 
 ./busybox echo "About to take over init. This script will now pause for a few seconds."
 ./busybox echo "If the takeover was successful, you will see output from the new init."
 ./busybox echo "You may then kill the remnants of this session and any remaining"
 
-./busybox mount --bind tmp/${OLD_INIT##*/} ${OLD_INIT}
+./busybox mount --bind "tmp/${INIT_NAME}" "${OLD_INIT}"
 
 telinit u
 
