@@ -57,16 +57,21 @@ Both `OsMutation.sh` and `OsMutationTight.sh` support CLI flags:
 | `--reboot` / `--no-reboot` | Automatically reboot or skip reboot prompt when `sshd` check passes |
 | `-h, --help` | Print CLI help |
 
-## OpenVZ 7 Compatibility Notice / OpenVZ 7 兼容性说明
+## Compatibility Matrix & Safety Guards / 兼容性矩阵与防变砖保护
 
 - **Warning**: A fresh OS will be installed and **all existing data will be wiped**. Back up important files first! Root password, `/root/.ssh`, custom SSH port, and network configuration (`eth0` / `venet0` / `onlink` routes / IPv6) are preserved automatically.
-- **Debian/Ubuntu → Alpine Password Protection**: Debian 12/13 and Ubuntu 22.04+ store root passwords using `yescrypt` (`$y$`), which Alpine (`musl libc`) cannot verify. The script automatically detects this before wiping and prompts you to set a compatible root password (or pass `--password`), preventing SSH lockouts.
-- **OpenVZ 7 Old Kernel (`3.10.x`)**:
-  - **Alpine 3.x** (OpenRC + musl) works reliably on OpenVZ 7 and low-RAM NAT VPS.
-  - **Debian 12 (Bookworm)** and **Ubuntu 22.04 (Jammy)** generally work on OpenVZ 7.
-  - **Debian 13+**, **Ubuntu 24.04+**, and **EL 10+** ship newer `systemd` versions requiring **cgroup v2**, which may fail to boot on OpenVZ 7 (`3.10.x` kernel). The script detects old OpenVZ kernels automatically and warns before proceeding.
-  - On OpenVZ, enter `0` at the OS selection menu to switch to the legacy `v0.0.1` OpenVZ 7 template archive.
-- OpenVZ 6 is not supported.
+- **cgroup v1 vs cgroup v2 (`systemd >= 258` Hard Block)**:
+  - Even on newer OpenVZ kernels (e.g. `6.1.0`), many providers still expose **cgroup v1** (`/sys/fs/cgroup` mounted as `tmpfs`).
+  - **Ubuntu 26.04 (systemd 259)** and future **Debian 14 / EL 11 (`systemd >= 258`)** have **completely removed cgroup v1 support** — PID 1 will refuse to boot and leave the container `Offline`.
+  - The script detects your container's real `cgroup` version (`v1` vs `v2`) **and** dynamically inspects the extracted target image's `libsystemd-shared-*.so` version before wiping the old OS, blocking incompatible installs automatically.
+  - **Recommended for cgroup v1 containers**: **Alpine 3.x** (OpenRC, no systemd), **Debian 12 (systemd 252)**, **Debian 13 (systemd 257)**, **Ubuntu 22.04 (systemd 249)**, **Ubuntu 24.04 (systemd 255)**, **EL 9/10 (systemd 252/257)**.
+- **CPU x86-64 ISA Guard (`EL 9/10`)**:
+  - **CentOS/Rocky/AlmaLinux 10** require an **`x86-64-v3`** CPU (AVX2/BMI2/FMA); **EL 9** requires **`x86-64-v2`**.
+  - The script checks `/proc/cpuinfo` flags upfront **and** runs a live `chroot /x /bin/sh -c true` test before wiping the old OS so older CPUs will never be bricked with `SIGILL`.
+- **Low-RAM (`<= 192 MiB`) & Alpine `$y$` Password Protection**:
+  - Debian 12/13 and Ubuntu 22.04+ store root passwords using `yescrypt` (`$y$`), which Alpine (`musl libc`) cannot verify. The script automatically detects this before wiping and prompts you to set a compatible root password (or pass `--password`).
+  - On `<= 192 MiB` NAT VPS, **Alpine 3.x** or **Debian 12/13** is strongly recommended over Ubuntu/EL.
+- **OpenVZ 7 Old Kernel (`3.10.x`)**: Prefer **Alpine 3.x**, **Debian 12**, **Ubuntu 22.04**, or enter `0` for the legacy `v0.0.1` OpenVZ 7 template archive. OpenVZ 6 is not supported.
 
 ## Key Engineering Improvements in This Fork
 

@@ -145,6 +145,49 @@ function detect_arch(){
     esac
 }
 
+function detect_cgroup_version(){
+    if [ -f /sys/fs/cgroup/cgroup.controllers ] || grep -q ' /sys/fs/cgroup cgroup2 ' /proc/mounts 2>/dev/null; then
+        echo "v2"
+    else
+        echo "v1"
+    fi
+}
+
+function detect_x86_64_level(){
+    if [[ "$(detect_arch)" != "amd64" ]] || [ ! -r /proc/cpuinfo ]; then
+        echo "n/a"
+        return 0
+    fi
+    local flags
+    flags=$(awk -F: '/^flags/{print $2; exit}' /proc/cpuinfo 2>/dev/null)
+    local has_v2=1 has_v3=1 f
+    for f in cx16 lahf_lm popcnt sse4_1 sse4_2 ssse3; do
+        if ! printf ' %s ' "$flags" | grep -q " ${f} "; then
+            has_v2=0
+            break
+        fi
+    done
+    if (( has_v2 == 0 )); then
+        echo "x86-64-v1"
+        return 0
+    fi
+    for f in avx avx2 bmi1 bmi2 f16c fma movbe xsave; do
+        if ! printf ' %s ' "$flags" | grep -q " ${f} "; then
+            has_v3=0
+            break
+        fi
+    done
+    if (( has_v3 == 1 )); then
+        echo "x86-64-v3"
+    else
+        echo "x86-64-v2"
+    fi
+}
+
+function detect_ram_mb(){
+    awk '/^MemTotal:/{printf "%d", int($2 / 1024); exit}' /proc/meminfo 2>/dev/null || echo "0"
+}
+
 function has_ipv4_default_route(){
     if command -v ip >/dev/null 2>&1; then
         ip -4 route show default 2>/dev/null | grep -q default
@@ -241,7 +284,7 @@ function read_virt_tech(){
     fi
 
     if [[ "$cttype" == "lxc" || "$cttype" == "openvz" ]]; then
-        echo -e "\e[1;33mYour container type: ${cttype} (arch: $(detect_arch), kernel: $(uname -r))\e[m"
+        echo -e "\e[1;33mYour container type: ${cttype} (arch: $(detect_arch), kernel: $(uname -r), cgroup: $(detect_cgroup_version), cpu: $(detect_x86_64_level), ram: $(detect_ram_mb) MiB)\e[m"
     else
         while [[ "$cttype" != 'lxc' && "$cttype" != 'openvz' && "$cttype" != 'kvm' ]]; do
             echo -ne "\e[1;33mplease input container type (lxc/openvz/kvm): \e[m"
@@ -265,9 +308,93 @@ function is_old_openvz_kernel(){
 
 function check_openvz_kernel_compat(){
     local target="$1"
+    local cg_ver cpu_lvl ram_mb ver=""
+    cg_ver=$(detect_cgroup_version)
+    cpu_lvl=$(detect_x86_64_level)
+    ram_mb=$(detect_ram_mb)
+
+    # 1. Hard cgroup v1 incompatibility: systemd >= 258 completely removed cgroup v1 support
+    #    (Ubuntu >= 26.04 ships systemd 259; Debian >= 14 & EL >= 11 will also ship systemd >= 258)
+    local cgroup_fatal=0
+    if [[ "$cg_ver" == "v1" ]]; then
+        if [[ "$target" =~ ^ubuntu-([0-9]+)\. ]]; then
+            ver="${BASH_REMATCH[1]}"
+            (( ver >= 26 )) && cgroup_fatal=1
+        elif echo "$target" | grep -qiE 'ubuntu-resolute'; then
+            cgroup_fatal=1
+        elif [[ "$target" =~ ^debian-([0-9]+)- ]]; then
+            ver="${BASH_REMATCH[1]}"
+            (( ver >= 14 )) && cgroup_fatal=1
+        elif echo "$target" | grep -qiE 'debian-(forky|duke|sid)'; then
+            cgroup_fatal=1
+        elif [[ "$target" =~ ^(centos|rockylinux|almalinux)-([0-9]+) ]]; then
+            ver="${BASH_REMATCH[2]}"
+            (( ver >= 11 )) && cgroup_fatal=1
+        fi
+    fi
+
+    if (( cgroup_fatal == 1 )); then
+        echo -e "\e[1;31m========================================================================\e[m"
+        echo -e "\e[1;31m[BLOCKED] cgroup v1 Incompatibility — Container WILL NOT BOOT!\e[m"
+        echo -e "\e[1;33mDetected host environment: ${cttype}, kernel $(uname -r), cgroup v1 (legacy).\e[m"
+        echo -e "\e[1;33mSelected OS '${target}' ships systemd >= 258, which REMOVED cgroup v1 support.\e[m"
+        echo -e "\e[1;33mPID 1 will immediately exit on boot and leave your VPS permanently Offline!\e[m"
+        echo -e "\e[1;32mCompatible choices for cgroup v1: Alpine 3.x, Debian 12/13, Ubuntu 22.04/24.04.\e[m"
+        echo -e "\e[1;31m========================================================================\e[m"
+        if (( CLI_FORCE == 1 )); then
+            echo -e "\e[1;33m--force specified, proceeding despite cgroup v1 hard incompatibility.\e[m"
+        elif (( CLI_YES == 1 )); then
+            echo -e "\e[1;31mAborting in non-interactive mode (--yes). Pass --force to override this safety block.\e[m"
+            return 1
+        else
+            local confirm=""
+            echo -ne "\e[1;33mForce continue anyway? (type 'FORCE' to override, or Enter to pick another OS): \e[m"
+            read -r confirm < /dev/tty
+            if [[ "$confirm" != "FORCE" ]]; then
+                return 1
+            fi
+        fi
+    fi
+
+    # 2. CPU x86-64 ISA level check (EL 10 requires x86-64-v3 / AVX2; EL 9 requires x86-64-v2)
+    local isa_fatal=0 isa_req=""
+    if [[ "$cpu_lvl" == "x86-64-v1" || "$cpu_lvl" == "x86-64-v2" ]]; then
+        if [[ "$target" =~ ^(centos|rockylinux|almalinux)-([0-9]+) ]]; then
+            ver="${BASH_REMATCH[2]}"
+            if (( ver >= 10 )) && [[ "$cpu_lvl" != "x86-64-v3" ]]; then
+                isa_fatal=1
+                isa_req="x86-64-v3 (AVX2/BMI2/FMA)"
+            elif (( ver == 9 )) && [[ "$cpu_lvl" == "x86-64-v1" ]]; then
+                isa_fatal=1
+                isa_req="x86-64-v2 (SSE4.2/POPCNT)"
+            fi
+        fi
+    fi
+
+    if (( isa_fatal == 1 )); then
+        echo -e "\e[1;31m========================================================================\e[m"
+        echo -e "\e[1;31m[BLOCKED] CPU Architecture ISA Too Old — Binaries Will Crash (SIGILL)!\e[m"
+        echo -e "\e[1;33mDetected CPU level: ${cpu_lvl}. Selected OS '${target}' requires ${isa_req}.\e[m"
+        echo -e "\e[1;32mRecommended for this CPU: Alpine 3.x, Debian 12/13, Ubuntu 22.04/24.04.\e[m"
+        echo -e "\e[1;31m========================================================================\e[m"
+        if (( CLI_FORCE == 1 )); then
+            echo -e "\e[1;33m--force specified, proceeding despite CPU ISA mismatch.\e[m"
+        elif (( CLI_YES == 1 )); then
+            echo -e "\e[1;31mAborting in non-interactive mode (--yes). Pass --force to override this safety block.\e[m"
+            return 1
+        else
+            local confirm=""
+            echo -ne "\e[1;33mForce continue anyway? (type 'FORCE' to override, or Enter to pick another OS): \e[m"
+            read -r confirm < /dev/tty
+            if [[ "$confirm" != "FORCE" ]]; then
+                return 1
+            fi
+        fi
+    fi
+
+    # 3. Old OpenVZ 7 kernel (< 4.15, e.g. 3.10.x) check for modern systemd distros
     if [[ "$cttype" == "openvz" ]] && is_old_openvz_kernel; then
         local risky=0
-        local ver=""
         if [[ "$target" =~ ^debian-([0-9]+)- ]]; then
             ver="${BASH_REMATCH[1]}"
             (( ver >= 13 )) && risky=1
@@ -285,25 +412,81 @@ function check_openvz_kernel_compat(){
 
         if (( risky == 1 )); then
             echo -e "\e[1;31m========================================================================\e[m"
-            echo -e "\e[1;31m[WARNING] OpenVZ Old Kernel Compatibility Risk!\e[m"
-            echo -e "\e[1;33mDetected OpenVZ kernel: $(uname -r) (cgroup v1 only).\e[m"
-            echo -e "\e[1;33mSelected OS '${target}' ships newer systemd that requires cgroup v2.\e[m"
-            echo -e "\e[1;33mReinstalling it on OpenVZ 7 will VERY LIKELY fail to boot / lose SSH!\e[m"
+            echo -e "\e[1;31m[WARNING] OpenVZ 7 Old Kernel Compatibility Risk!\e[m"
+            echo -e "\e[1;33mDetected old OpenVZ kernel: $(uname -r) (< 4.15).\e[m"
+            echo -e "\e[1;33mSelected OS '${target}' ships newer systemd/glibc that may fail on 3.10.x kernels.\e[m"
             echo -e "\e[1;32mRecommended for OpenVZ 7: Alpine 3.x, Debian 12 (bookworm), Ubuntu 22.04, or [0] Legacy v0.0.1.\e[m"
             echo -e "\e[1;31m========================================================================\e[m"
             if (( CLI_FORCE == 1 )); then
-                echo -e "\e[1;33m--force specified, proceeding despite OpenVZ old-kernel risk.\e[m"
-                return 0
-            fi
-            local confirm
-            echo -ne "\e[1;33mContinue anyway? (y/N): \e[m"
-            read -r confirm < /dev/tty
-            if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+                echo -e "\e[1;33m--force specified, proceeding despite OpenVZ 7 old-kernel risk.\e[m"
+            elif (( CLI_YES == 1 )); then
+                echo -e "\e[1;31mAborting in non-interactive mode (--yes). Pass --force to override.\e[m"
                 return 1
+            else
+                local confirm=""
+                echo -ne "\e[1;33mContinue anyway? (y/N): \e[m"
+                read -r confirm < /dev/tty
+                if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+                    return 1
+                fi
             fi
         fi
     fi
+
+    # 4. Low-RAM advisory (<= 192 MiB) for heavier distros (Ubuntu / EL)
+    if [[ "$ram_mb" =~ ^[0-9]+$ ]] && (( ram_mb > 0 && ram_mb <= 192 )); then
+        if [[ "$target" == ubuntu-* || "$target" == centos-* || "$target" == rockylinux-* || "$target" == almalinux-* ]]; then
+            echo -e "\e[1;33m[NOTICE] Low RAM detected (${ram_mb} MiB). '${target}' runs heavier background services and may OOM.\e[m"
+            echo -e "\e[1;32mFor <=192 MiB VPS, Alpine 3.x or Debian 12/13 is strongly recommended.\e[m"
+            if (( CLI_YES == 0 && CLI_FORCE == 0 )); then
+                local confirm=""
+                echo -ne "\e[1;33mContinue with '${target}' on ${ram_mb} MiB RAM? (y/N): \e[m"
+                read -r confirm < /dev/tty
+                if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+                    return 1
+                fi
+            fi
+        fi
+    fi
+
     return 0
+}
+
+function verify_extracted_rootfs_compat(){
+    # Live pre-wipe verification on extracted /x BEFORE deleting a single file of the old OS!
+    # 1. Verify target glibc / CPU ISA / kernel ABI can actually execute a binary
+    if ! chroot /x /bin/sh -c 'true' >/dev/null 2>&1; then
+        echo -e "\e[1;31m========================================================================\e[m"
+        echo -e "\e[1;31m[ABORTED] Target OS binary test ('chroot /x /bin/sh -c true') FAILED!\e[m"
+        echo -e "\e[1;33mPossible causes: CPU ISA too old (e.g. EL 10 requires x86-64-v3), kernel too old, or corrupt image.\e[m"
+        echo -e "\e[1;32mYour existing system has NOT been modified. Cleaning up /x and exiting safely.\e[m"
+        echo -e "\e[1;31m========================================================================\e[m"
+        safe_rm_x
+        exit 1
+    fi
+
+    # 2. Dynamically detect actual systemd version inside /x against host cgroup version
+    if [[ "$(detect_cgroup_version)" == "v1" ]]; then
+        local sd_lib sd_major=""
+        sd_lib=$(find /x/usr/lib /x/lib -maxdepth 3 -name 'libsystemd-shared-*.so' 2>/dev/null | head -n 1)
+        if [[ -n "$sd_lib" ]]; then
+            sd_major=$(basename "$sd_lib" | sed -nE 's/^libsystemd-shared-([0-9]+).*/\1/p')
+        fi
+        if [[ "$sd_major" =~ ^[0-9]+$ ]] && (( sd_major >= 258 )); then
+            echo -e "\e[1;31m========================================================================\e[m"
+            echo -e "\e[1;31m[ABORTED] Extracted OS ships systemd ${sd_major} (>= 258) on a cgroup v1 host!\e[m"
+            echo -e "\e[1;33msystemd >= 258 removed cgroup v1 support completely and will refuse to boot PID 1.\e[m"
+            if (( CLI_FORCE == 0 )); then
+                echo -e "\e[1;32mYour existing system has NOT been modified. Cleaning up /x and exiting safely.\e[m"
+                echo -e "\e[1;31m========================================================================\e[m"
+                safe_rm_x
+                exit 1
+            else
+                echo -e "\e[1;33m--force specified, overriding systemd ${sd_major} cgroup v1 safety block!\e[m"
+                echo -e "\e[1;31m========================================================================\e[m"
+            fi
+        fi
+    fi
 }
 
 function check_password_compat(){
@@ -1066,22 +1249,32 @@ function post_install(){
             sed -i 's/--auto/-a/' /etc/init.d/networking
         fi
     elif [[ "$os_id" == "debian" || "$os_id" == "ubuntu" ]] || [ -f /etc/debian_version ]; then
-        install openssh-server ifupdown
+        # Install openssh-server with --no-install-recommends to skip heavy python3/ssh-import-id bloat on 128MB VPS
+        DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Languages=none update
+        DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Languages=none install -y --no-install-recommends openssh-server
+        DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Languages=none install -y ifupdown
         apt-get clean 2>/dev/null || true
         # Remove Alpine-only 'hostname ...' directives if migrating from Alpine
         if [ -f /etc/network/interfaces ]; then
             sed -i -E '/^[[:space:]]*hostname[[:space:]]+/d' /etc/network/interfaces
         fi
-        systemctl enable ssh 2>/dev/null || systemctl enable sshd 2>/dev/null || true
+        # Disable ssh.socket (Ubuntu 24.04+/26.04 socket activation ignores custom Port in sshd_config.d)
+        systemctl disable ssh.socket 2>/dev/null || true
+        rm -f /etc/systemd/system/sockets.target.wants/ssh.socket /etc/systemd/system/ssh.service.requires/ssh.socket 2>/dev/null || true
+        systemctl enable ssh.service 2>/dev/null || systemctl enable sshd.service 2>/dev/null || true
         systemctl enable networking.service 2>/dev/null || true
         systemctl disable systemd-networkd.service 2>/dev/null || true
         systemctl disable systemd-networkd.socket 2>/dev/null || true
         systemctl disable systemd-networkd-wait-online.service 2>/dev/null || true
         systemctl disable systemd-network-generator.service 2>/dev/null || true
+        systemctl disable systemd-networkd-resolve-hook.socket 2>/dev/null || true
+        systemctl disable systemd-networkd-varlink.socket 2>/dev/null || true
+        systemctl disable netplan-configure.service 2>/dev/null || true
         rm -f /etc/netplan/*.yaml 2>/dev/null || true
     elif [[ "$os_id" == "centos" || "$os_id" == "rocky" || "$os_id" == "almalinux" || "$os_id" == "rhel" ]] || [ -f /etc/redhat-release ]; then
         install openssh-server NetworkManager
-        systemctl enable sshd 2>/dev/null || true
+        systemctl disable sshd.socket 2>/dev/null || true
+        systemctl enable sshd.service 2>/dev/null || systemctl enable sshd 2>/dev/null || true
         systemctl enable NetworkManager 2>/dev/null || true
         configure_el_networkmanager
     else
@@ -1182,6 +1375,8 @@ function main(){
 
     echo -e '\e[1;32mdownloading template...\e[m'
     download_rootfs
+    echo -e '\e[1;32mverifying extracted rootfs compatibility...\e[m'
+    verify_extracted_rootfs_compat
     echo -e '\e[1;32mmigrating configuration...\e[m'
     migrate_configuration
     echo -e '\e[1;32mreplacing old files...\e[m'
