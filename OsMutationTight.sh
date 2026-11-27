@@ -206,16 +206,15 @@ function read_virt_tech(){
 
 function install(){
     if [ -n "$(command -v apt-get)" ]; then
-        DEBIAN_FRONTEND=noninteractive apt-get update
-        DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+        DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Languages=none update
+        DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Languages=none install -y "$@"
     elif [ -n "$(command -v dnf)" ]; then
         dnf makecache -q || true
         dnf install -y "$@"
     elif [ -n "$(command -v yum)" ]; then
         yum install -y "$@"
     elif [ -n "$(command -v apk)" ]; then
-        apk update
-        apk add "$@"
+        apk add --no-cache "$@"
     else
         echo "Error: Not Supported OS"
         exit 1
@@ -902,7 +901,11 @@ function post_install(){
     fi
 
     if [[ "$os_id" == "alpine" ]] || [ -f /etc/alpine-release ]; then
-        install openssh bash ifupdown-ng
+        if ! install openssh bash ifupdown-ng; then
+            echo -e "\e[1;33mRetrying apk fix --no-cache (low-memory trigger recovery)...\e[m"
+            apk fix --no-cache || true
+            command -v sshd >/dev/null 2>&1 || apk add --no-cache openssh || true
+        fi
         rc-update add sshd default
         rc-update add networking default
         rc-update add mdev sysinit || true
@@ -912,6 +915,7 @@ function post_install(){
         fi
     elif [[ "$os_id" == "debian" || "$os_id" == "ubuntu" ]] || [ -f /etc/debian_version ]; then
         install openssh-server ifupdown
+        apt-get clean 2>/dev/null || true
         if [ -f /etc/network/interfaces ]; then
             sed -i -E '/^[[:space:]]*hostname[[:space:]]+/d' /etc/network/interfaces
         fi
@@ -987,12 +991,32 @@ function post_install(){
 
 function install_requirement(){
     ensure_network_dns
-    if [ -n "$(command -v apk)" ]; then
-        install curl sed gawk wget gzip xz tar virt-what iproute2 ca-certificates
-    elif [ -n "$(command -v apt-get)" ]; then
-        install curl sed gawk wget gzip xz-utils tar virt-what iproute2 ca-certificates
+
+    local missing=()
+    local xz_pkg="xz" ip_pkg="iproute2"
+    if [ -n "$(command -v apt-get)" ]; then
+        xz_pkg="xz-utils"
+    elif [ -n "$(command -v dnf)" ] || [ -n "$(command -v yum)" ]; then
+        ip_pkg="iproute"
+    fi
+
+    command -v curl >/dev/null 2>&1 || missing+=("curl")
+    command -v sed >/dev/null 2>&1 || missing+=("sed")
+    command -v awk >/dev/null 2>&1 || missing+=("gawk")
+    command -v gzip >/dev/null 2>&1 || missing+=("gzip")
+    command -v xz >/dev/null 2>&1 || missing+=("$xz_pkg")
+    (tar --version 2>/dev/null | grep -qi 'GNU tar') || missing+=("tar")
+    command -v virt-what >/dev/null 2>&1 || missing+=("virt-what")
+    command -v ip >/dev/null 2>&1 || missing+=("$ip_pkg")
+    if [ ! -f /etc/ssl/certs/ca-certificates.crt ] && [ ! -f /etc/pki/tls/certs/ca-bundle.crt ]; then
+        missing+=("ca-certificates")
+    fi
+
+    if [ "${#missing[@]}" -eq 0 ]; then
+        echo -e "\e[1;32mAll requirements already installed, skipping package manager update.\e[m"
     else
-        install curl sed gawk wget gzip xz tar virt-what iproute ca-certificates
+        echo -e "\e[1;32mInstalling missing packages: ${missing[*]}\e[m"
+        install "${missing[@]}"
     fi
     ensure_network_dns
 }
@@ -1063,11 +1087,11 @@ function make_temp_os(){
     fi
 
     echo -e "\e[1;32mPreparing temporary Alpine chroot from ${temp_os_url} ...\e[m"
-    rm -rf /x
+    safe_rm_x
     mkdir -p /x
     if ! fetch_url "$temp_os_url" | tar -C /x -xz; then
         echo -e "\e[1;31mError: Failed to prepare temporary Alpine chroot.\e[m"
-        rm -rf /x
+        safe_rm_x
         exit 1
     fi
 
@@ -1097,7 +1121,7 @@ function make_temp_os(){
     if ! chroot /x /bin/sh -c "[ -x /bin/bash ] || apk add --no-cache bash"; then
         echo -e "\e[1;31mError: Failed to install bash in temporary Alpine chroot.\e[m"
         cleanup_chroot_mounts
-        rm -rf /x
+        safe_rm_x
         exit 1
     fi
 
