@@ -705,7 +705,7 @@ function migrate_configuration(){
     gw6=$(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); exit}}')
 
     mkdir -p "/${dest_os_dir}/etc/network/"
-    if [ -f /etc/network/interfaces ] && grep -qE '(static|venet0|inet6)' /etc/network/interfaces; then
+    if [ -f /etc/network/interfaces ] && grep -vE '^[[:space:]]*(#|$)' /etc/network/interfaces | grep -qE '(static|venet0|inet6)'; then
         cp -rf /etc/network/interfaces "/${dest_os_dir}/etc/network/interfaces"
         [ -d /etc/network/interfaces.d ] && cp -a /etc/network/interfaces.d "/${dest_os_dir}/etc/network/"
     elif [[ "$dev" == venet0* ]]; then
@@ -793,22 +793,47 @@ function migrate_configuration(){
     fi
 }
 
+function safe_rm_x(){
+    hash -r
+    local m
+    for m in /x/oldroot /x/sys /x/proc /x/dev/pts /x/dev; do
+        if grep -q " ${m} " /proc/mounts 2>/dev/null; then
+            umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null || true
+        fi
+    done
+    if grep -q ' /x/' /proc/mounts 2>/dev/null; then
+        echo -e "\e[1;33mWarning: Active mountpoint still detected under /x/; skipping 'rm -rf /x' for safety.\e[m"
+        return 0
+    fi
+    rm -rf /x
+}
+
 function configure_sshd(){
+    local use_dropin=0
+    if [ -d /etc/ssh/sshd_config.d ] && [ -f /etc/ssh/sshd_config ] && grep -qE '^[[:space:]]*Include[[:space:]].*sshd_config\.d' /etc/ssh/sshd_config; then
+        use_dropin=1
+    fi
+
     if [ -f /etc/ssh/sshd_config ]; then
         sed -i -E 's/^[[:space:]]*PermitRootLogin[[:space:]].*/#&/' /etc/ssh/sshd_config
         sed -i -E 's/^[[:space:]]*PasswordAuthentication[[:space:]].*/#&/' /etc/ssh/sshd_config
-        {
-            echo ""
-            echo "# Added by OsMutation"
-            echo "PermitRootLogin yes"
-            echo "PasswordAuthentication yes"
-            if [[ -n "$SSH_PORT" && "$SSH_PORT" != "22" ]]; then
-                echo "Port ${SSH_PORT}"
-            fi
-        } >> /etc/ssh/sshd_config
+        if [[ -n "$SSH_PORT" && "$SSH_PORT" != "22" ]]; then
+            sed -i -E 's/^[[:space:]]*Port[[:space:]].*/#&/' /etc/ssh/sshd_config
+        fi
+        if (( use_dropin == 0 )); then
+            {
+                echo ""
+                echo "# Added by OsMutation"
+                echo "PermitRootLogin yes"
+                echo "PasswordAuthentication yes"
+                if [[ -n "$SSH_PORT" && "$SSH_PORT" != "22" ]]; then
+                    echo "Port ${SSH_PORT}"
+                fi
+            } >> /etc/ssh/sshd_config
+        fi
     fi
 
-    if [ -d /etc/ssh/sshd_config.d ]; then
+    if (( use_dropin == 1 )); then
         {
             echo "# Added by OsMutation (first-match-wins)"
             echo "PermitRootLogin yes"
@@ -867,6 +892,7 @@ function configure_el_networkmanager(){
 
 function post_install(){
     export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    hash -r
     # shellcheck disable=SC1091
     [ -f /tmp/osmutation_env ] && source /tmp/osmutation_env
 
@@ -907,7 +933,9 @@ function post_install(){
     fi
 
     if [ -f /tmp/.osmutation_passwd ]; then
-        if chpasswd -c SHA512 < /tmp/.osmutation_passwd 2>/dev/null || chpasswd < /tmp/.osmutation_passwd; then
+        if chpasswd -c sha512 < /tmp/.osmutation_passwd 2>/dev/null \
+            || chpasswd -c SHA512 < /tmp/.osmutation_passwd 2>/dev/null \
+            || chpasswd < /tmp/.osmutation_passwd; then
             echo -e "\e[1;32mNew root password applied successfully.\e[m"
         else
             echo -e "\e[1;31mWARNING: Failed to apply new root password via chpasswd! Please run 'passwd root' manually before rebooting!\e[m"
@@ -916,7 +944,8 @@ function post_install(){
     fi
 
     configure_sshd
-    rm -rf /x /tmp/osmutation_env
+    rm -f /tmp/osmutation_env
+    safe_rm_x
     sync
 
     local ssh_ok=1
@@ -1004,9 +1033,10 @@ function cleanup_chroot_mounts(){
     if (( CHROOT_MOUNTS_ACTIVE == 0 )); then
         return 0
     fi
+    hash -r
     local m
     for m in /x/oldroot /x/sys /x/proc /x/dev/pts /x/dev; do
-        if mountpoint -q "$m" 2>/dev/null; then
+        if grep -q " ${m} " /proc/mounts 2>/dev/null || mountpoint -q "$m" 2>/dev/null; then
             umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null || true
         fi
     done
@@ -1046,7 +1076,11 @@ function make_temp_os(){
 
     local script_self
     script_self=$(readlink -f "$0" 2>/dev/null || echo "$0")
-    cp "$script_self" /x/OsMutationTight.sh
+    if [ -f "$script_self" ]; then
+        cp "$script_self" /x/OsMutationTight.sh
+    else
+        fetch_url "https://raw.githubusercontent.com/${REPO}/main/OsMutationTight.sh" > /x/OsMutationTight.sh
+    fi
     chmod +x /x/OsMutationTight.sh
 
     # Mount essential pseudo-filesystems so /dev/tty, /dev/null, /dev/urandom, /proc work inside chroot
@@ -1077,7 +1111,7 @@ function make_temp_os(){
 
     if (( chroot_rc != 0 || replaced == 0 )); then
         if (( replaced == 0 )); then
-            rm -rf /x
+            safe_rm_x
         fi
         exit "$chroot_rc"
     fi
@@ -1086,15 +1120,28 @@ function make_temp_os(){
     post_install
 }
 
-if [ -z "${main:-}" ]; then
-    for _arg in "$@"; do
-        case "$_arg" in
+function is_readonly_cli_invocation(){
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --os|-p|--password|--ssh-port)
+                shift 2 2>/dev/null || break
+                ;;
             -h|--help|--list)
-                make_temp_os "$@"
-                exit $?
+                return 0
+                ;;
+            *)
+                shift
                 ;;
         esac
     done
+    return 1
+}
+
+if [ -z "${main:-}" ]; then
+    if is_readonly_cli_invocation "$@"; then
+        make_temp_os "$@"
+        exit $?
+    fi
     LOG_FILE="/run/osmutation.log"
     [ -w /run ] || LOG_FILE="/tmp/osmutation.log"
     make_temp_os "$@" 2>&1 | tee "$LOG_FILE"

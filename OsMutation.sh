@@ -766,8 +766,8 @@ function migrate_configuration(){
     gw6=$(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); exit}}')
 
     mkdir -p /x/etc/network/
-    # Preserve existing /etc/network/interfaces when it already configures static or OpenVZ venet0
-    if [ -f /etc/network/interfaces ] && grep -qE '(static|venet0|inet6)' /etc/network/interfaces; then
+    # Preserve existing /etc/network/interfaces when it already configures static or OpenVZ venet0 (ignoring comments)
+    if [ -f /etc/network/interfaces ] && grep -vE '^[[:space:]]*(#|$)' /etc/network/interfaces | grep -qE '(static|venet0|inet6)'; then
         cp -rf /etc/network/interfaces /x/etc/network/interfaces
         [ -d /etc/network/interfaces.d ] && cp -a /etc/network/interfaces.d /x/etc/network/
     elif [[ "$dev" == venet0* ]]; then
@@ -918,28 +918,54 @@ function replace_os(){
         fi
     '
 
+    hash -r
     if (( dev_mounted == 1 )); then
         umount /x/dev 2>/dev/null || umount -l /x/dev 2>/dev/null || true
     fi
     umount /x/oldroot 2>/dev/null || umount -l /x/oldroot 2>/dev/null || true
 }
 
+function safe_rm_x(){
+    hash -r
+    local m
+    for m in /x/oldroot /x/sys /x/proc /x/dev/pts /x/dev; do
+        if grep -q " ${m} " /proc/mounts 2>/dev/null; then
+            umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null || true
+        fi
+    done
+    if grep -q ' /x/' /proc/mounts 2>/dev/null; then
+        echo -e "\e[1;33mWarning: Active mountpoint still detected under /x/; skipping 'rm -rf /x' for safety.\e[m"
+        return 0
+    fi
+    rm -rf /x
+}
+
 function configure_sshd(){
+    local use_dropin=0
+    if [ -d /etc/ssh/sshd_config.d ] && [ -f /etc/ssh/sshd_config ] && grep -qE '^[[:space:]]*Include[[:space:]].*sshd_config\.d' /etc/ssh/sshd_config; then
+        use_dropin=1
+    fi
+
     if [ -f /etc/ssh/sshd_config ]; then
         sed -i -E 's/^[[:space:]]*PermitRootLogin[[:space:]].*/#&/' /etc/ssh/sshd_config
         sed -i -E 's/^[[:space:]]*PasswordAuthentication[[:space:]].*/#&/' /etc/ssh/sshd_config
-        {
-            echo ""
-            echo "# Added by OsMutation"
-            echo "PermitRootLogin yes"
-            echo "PasswordAuthentication yes"
-            if [[ -n "$SSH_PORT" && "$SSH_PORT" != "22" ]]; then
-                echo "Port ${SSH_PORT}"
-            fi
-        } >> /etc/ssh/sshd_config
+        if [[ -n "$SSH_PORT" && "$SSH_PORT" != "22" ]]; then
+            sed -i -E 's/^[[:space:]]*Port[[:space:]].*/#&/' /etc/ssh/sshd_config
+        fi
+        if (( use_dropin == 0 )); then
+            {
+                echo ""
+                echo "# Added by OsMutation"
+                echo "PermitRootLogin yes"
+                echo "PasswordAuthentication yes"
+                if [[ -n "$SSH_PORT" && "$SSH_PORT" != "22" ]]; then
+                    echo "Port ${SSH_PORT}"
+                fi
+            } >> /etc/ssh/sshd_config
+        fi
     fi
 
-    if [ -d /etc/ssh/sshd_config.d ]; then
+    if (( use_dropin == 1 )); then
         {
             echo "# Added by OsMutation (first-match-wins)"
             echo "PermitRootLogin yes"
@@ -999,6 +1025,7 @@ function configure_el_networkmanager(){
 
 function post_install(){
     export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    hash -r
     # shellcheck disable=SC1091
     [ -f /tmp/osmutation_env ] && source /tmp/osmutation_env
 
@@ -1041,7 +1068,9 @@ function post_install(){
 
     # Apply new root password if requested or required for Alpine compatibility
     if [ -f /tmp/.osmutation_passwd ]; then
-        if chpasswd -c SHA512 < /tmp/.osmutation_passwd 2>/dev/null || chpasswd < /tmp/.osmutation_passwd; then
+        if chpasswd -c sha512 < /tmp/.osmutation_passwd 2>/dev/null \
+            || chpasswd -c SHA512 < /tmp/.osmutation_passwd 2>/dev/null \
+            || chpasswd < /tmp/.osmutation_passwd; then
             echo -e "\e[1;32mNew root password applied successfully.\e[m"
         else
             echo -e "\e[1;31mWARNING: Failed to apply new root password via chpasswd! Please run 'passwd root' manually before rebooting!\e[m"
@@ -1050,7 +1079,8 @@ function post_install(){
     fi
 
     configure_sshd
-    rm -rf /x /tmp/osmutation_env
+    rm -f /tmp/osmutation_env
+    safe_rm_x
     sync
 
     # Hard verification gate: verify sshd binary & config before recommending reboot
@@ -1137,14 +1167,27 @@ function main(){
     post_install
 }
 
-for _arg in "$@"; do
-    case "$_arg" in
-        -h|--help|--list)
-            main "$@"
-            exit $?
-            ;;
-    esac
-done
+function is_readonly_cli_invocation(){
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --os|-p|--password|--ssh-port)
+                shift 2 2>/dev/null || break
+                ;;
+            -h|--help|--list)
+                return 0
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+    return 1
+}
+
+if is_readonly_cli_invocation "$@"; then
+    main "$@"
+    exit $?
+fi
 
 LOG_FILE="/run/osmutation.log"
 [ -w /run ] || LOG_FILE="/tmp/osmutation.log"
